@@ -2377,6 +2377,40 @@ test_chunked_delivery_core(void)
     return failures;
 }
 
+/* A binding slot reused after a chunked delivery keeps (does not leak) the
+ * slot's reusable chunk-pin array: binding_open must not memset it away,
+ * which would lose the previous occupant's allocation. The counting
+ * allocator proves it. */
+static int
+test_binding_reuse_keeps_pin_array(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, NULL);
+    MOQ_TEST_CHECK(c != NULL);
+    moqr_binding_t pub, s1, s2;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 100, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 200, &s1) == MOQR_OK);
+    moqr_sub_t sub1;
+    moqr_track_t track = chunked_sub_setup(c, pub, s1, &sub1);
+    MOQ_TEST_CHECK(ing_chunked(c, &a, track, 5, 0, 0, 128, 3, 20, 0xA0) ==
+                   MOQR_OK);
+    moqr_delivery_t d;
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, s1, CTRL_NOW, &d) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(d.rec.chunk_count, 3);   /* pin array allocated */
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c, s1, MOQR_DELIVERY_DELIVERED,
+                                           CTRL_NOW) == MOQR_OK);
+
+    MOQ_TEST_CHECK(moqr_core_binding_close(c, s1, CTRL_NOW) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 300, &s2) == MOQR_OK);  /* s1's slot */
+
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("binding_reuse_keeps_pin_array");
+    return failures;
+}
+
 /* The REFUSED_UNBEGUN confirm contract, pinned at the CORE boundary (the
  * integrated scenarios exercise the behavior; this pins the API): a
  * pre-begin refusal RELEASES a chunked outstanding delivery (re-derived,
@@ -5866,6 +5900,7 @@ main(void)
     failures += test_grant_reval_stale_owner();
     failures += test_grant_retire_no_reval();
     failures += test_chunked_delivery_core();
+    failures += test_binding_reuse_keeps_pin_array();
     failures += test_refused_unbegun_contract();
     failures += test_forward_pause_release();
     failures += test_forward_pause_partial_resume();

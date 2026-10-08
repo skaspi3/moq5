@@ -2046,7 +2046,14 @@ moqr_core_binding_open(moqr_core_t *c, uint64_t session_cookie,
         if ((c->bindings[i].gen & 1u) == 0) {
             r_binding_t *b = &c->bindings[i];
             uint32_t gen = b->gen + 1;
+            /* The chunk-pin array belongs to the SLOT (grown lazily, reused,
+             * freed at destroy); close already dropped its pins. Keep it
+             * across the reset, or the previous occupant's array leaks. */
+            r_pin_chunk_t *pins = b->pin_chunks;
+            uint32_t pins_cap = b->pin_chunks_cap;
             memset(b, 0, sizeof(*b));
+            b->pin_chunks = pins;
+            b->pin_chunks_cap = pins_cap;
             b->gen = gen;
             b->cookie = session_cookie;
             b->subs_head = R_SUB_NIL;   /* empty (memset left it 0) */

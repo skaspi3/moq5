@@ -2962,6 +2962,20 @@ MOQ_API moq_result_t moq_session_reset_subgroup(
     uint64_t error_code,
     uint64_t now_us);
 
+/* True once the session itself has taken this subgroup's stream out of the
+ * caller's hands: the peer's STOP_SENDING made it queue a reset on its own
+ * (moq_session_on_data_stop; draft-18 Section 11.4.3: "The publisher SHOULD
+ * respond with a reset"), its FIN or reset is already queued, or the stream
+ * has since ended and its slot was reaped. Nothing more can be written,
+ * closed or reset on it, so a caller that still tracks the subgroup should
+ * let it go. Use it after a write, close or reset on the handle failed, to
+ * tell that case from a real fault. False while the subgroup is writable,
+ * once the session is no longer active, and for a handle that is not this
+ * session's subgroup handle. */
+MOQ_API bool moq_session_subgroup_gone(
+    const moq_session_t *s,
+    moq_subgroup_handle_t subgroup);
+
 typedef struct moq_publication_update_cfg {
     uint32_t struct_size;
     bool     has_subscriber_priority;

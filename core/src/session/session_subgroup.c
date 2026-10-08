@@ -701,6 +701,28 @@ moq_result_t moq_session_reset_subgroup(
     return MOQ_OK;
 }
 
+bool moq_session_subgroup_gone(const moq_session_t *s,
+                               moq_subgroup_handle_t subgroup)
+{
+    if (!s) return false;
+    /* A closed session frees every entry: its failures are not a peer stop. */
+    if (!session_is_active(s)) return false;
+    uint32_t pool = moq_handle_pool_tag(subgroup._opaque);
+    uint16_t tag  = moq_handle_session_tag(subgroup._opaque);
+    uint32_t slot = moq_handle_slot(subgroup._opaque);
+    uint32_t gen  = moq_handle_generation(subgroup._opaque);
+    /* Not this session's subgroup handle: a caller error, never "gone". */
+    if (pool != MOQ_HANDLE_POOL_SUBGROUP) return false;
+    if (tag != s->session_tag) return false;
+    if (slot >= s->sg_cap) return false;
+    const moq_sg_entry_t *e = &s->subgroups[slot];
+    /* The stream ended and its slot was reaped (and maybe reused since). */
+    if (e->generation != gen || e->state == MOQ_SG_FREE) return true;
+    /* A reset (the peer's STOP_SENDING, a delivery timeout) or a FIN is
+     * already queued: the stream's terminal is in hand. */
+    return e->state == MOQ_SG_RESETTING || e->state == MOQ_SG_CLOSING;
+}
+
 /* -- Streaming object send ----------------------------------------- */
 
 moq_result_t moq_session_begin_object(

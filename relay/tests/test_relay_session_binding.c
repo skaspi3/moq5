@@ -8138,6 +8138,291 @@ sub_done_resets_begun_subgroup(void)
     return rig.failures;
 }
 
+/* ---- Subscriber STOP_SENDING on one subgroup stream ------------------------ *
+ * draft-ietf-moq-transport-18 Section 11.4.3: "A subscriber MAY send a QUIC
+ * STOP_SENDING frame for a subgroup stream if the Group or Subgroup is no
+ * longer of interest to it. The publisher SHOULD respond with a reset." ...
+ * "Resets and STOP_SENDING on SUBSCRIBE data streams have no impact on other
+ * Subgroups in the Group or the subscription" ... "A publisher that receives a
+ * STOP_SENDING on a Subgroup stream SHOULD NOT attempt to open a new stream to
+ * deliver additional Objects in that Subgroup." (draft-16 reads the same.)
+ *
+ * The STOP reaches the relay's session the way the transport bridge delivers a
+ * peer's STOP_SENDING (moq_session_on_data_stop on the relay's session): the
+ * session resets the stream on its own and the binding is not told. The
+ * subscriber pair's trace hook remembers the relay's first downstream data
+ * stream (armed once the subscription is up) and the relay's close reason. */
+typedef struct stop_trace {
+    bool             armed;
+    bool             have;
+    moq_stream_ref_t ref;
+    char             close_reason[64];
+} stop_trace_t;
+
+static void
+stop_trace_fn(void *ctx, const moq_sim_trace_record_t *r)
+{
+    stop_trace_t *t = (stop_trace_t *)ctx;
+    if (r->struct_size < sizeof(*r) || r->kind != MOQ_SIM_TRACE_ACTION ||
+        r->from != MOQ_PERSPECTIVE_SERVER) {
+        return;   /* only the relay's own actions on the subscriber pair */
+    }
+    if (r->action_kind == MOQ_ACTION_SEND_DATA && t->armed && !t->have) {
+        t->ref = r->stream_ref;
+        t->have = true;
+    } else if (r->action_kind == MOQ_ACTION_CLOSE_SESSION) {
+        size_t n = r->detail_bytes.len < sizeof(t->close_reason) - 1
+                       ? r->detail_bytes.len
+                       : sizeof(t->close_reason) - 1;
+        if (n > 0) {
+            memcpy(t->close_reason, r->detail_bytes.data, n);
+        }
+        t->close_reason[n] = '\0';
+    }
+}
+
+/* The rig shared by both cases: publisher + subscriber, namespace,
+ * subscription. */
+typedef struct stop_rig {
+    ca_t         a;
+    rig_t        rig;
+    conn_t      *pub, *sub;
+    peer_state_t pub_ps, sub_ps;
+    stop_trace_t tr;
+    bool         created;   /* rig_create succeeded: rig_destroy owed */
+} stop_rig_t;
+
+/* Downstream subgroup slots the binding holds (only the subscriber has any). */
+static uint32_t
+stop_rig_open_sgs(const stop_rig_t *t)
+{
+    return moqr_bind_debug_conn_open_sgs(t->rig.bind, 0) +
+           moqr_bind_debug_conn_open_sgs(t->rig.bind, 1);
+}
+
+static bool
+stop_rig_open(stop_rig_t *t, moq_version_t version, bool streaming)
+{
+    memset(t, 0, sizeof(*t));
+    ca_init(&t->a);
+    if (rig_create(&t->rig, &t->a) != MOQR_OK) {
+        return false;
+    }
+    t->created = true;
+    g_test_server_streaming_objects = streaming;   /* chunked upstream ingest */
+    t->pub = rig_connect(&t->rig, version);
+    g_test_server_streaming_objects = false;
+    g_test_trace_fn = stop_trace_fn;
+    g_test_trace_ctx = &t->tr;
+    t->sub = rig_connect(&t->rig, version);
+    g_test_trace_fn = NULL;
+    g_test_trace_ctx = NULL;
+    if (t->pub == NULL || t->sub == NULL) {
+        return false;
+    }
+    rig_pump(&t->rig, 4);
+    moq_bytes_t nsp[1] = { B("stop") };
+    moq_publish_namespace_cfg_t pcfg;
+    moq_publish_namespace_cfg_init(&pcfg);
+    pcfg.track_namespace = (moq_namespace_t){ .parts = nsp, .count = 1 };
+    moq_announcement_t ann;
+    if (moq_session_publish_namespace(t->pub->peer, &pcfg, t->rig.now, &ann) !=
+        MOQ_OK) {
+        return false;
+    }
+    rig_pump(&t->rig, 4);
+    moq_subscribe_cfg_t scfg;
+    moq_subscribe_cfg_init(&scfg);
+    scfg.track_namespace = (moq_namespace_t){ .parts = nsp, .count = 1 };
+    scfg.track_name = B("v");
+    scfg.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
+    scfg.start_group = 0;
+    scfg.start_object = 0;
+    moq_subscription_t sh;
+    if (moq_session_subscribe(t->sub->peer, &scfg, t->rig.now, &sh) != MOQ_OK) {
+        return false;
+    }
+    rig_pump(&t->rig, 6);
+    peer_drain(&t->rig, t->pub, &t->pub_ps, true, false, 0, 0);   /* accept */
+    rig_pump(&t->rig, 6);
+    t->tr.armed = true;   /* the next relay data stream is group 0's */
+    return t->pub_ps.up_seen;
+}
+
+/* The subscriber's STOP_SENDING for the captured downstream stream. */
+static void
+stop_rig_stop(stop_rig_t *t)
+{
+    R_CHECK(&t->rig, t->tr.have);
+    t->tr.armed = false;
+    if (t->tr.have) {
+        R_CHECK(&t->rig, moq_session_on_data_stop(t->sub->rsess, t->tr.ref, 0x1,
+                                                  t->rig.now) == MOQ_OK);
+    }
+}
+
+static void
+stop_rig_write(stop_rig_t *t, moq_subgroup_handle_t h, uint64_t object_id,
+               size_t len, uint8_t fill)
+{
+    uint8_t body[256];
+    memset(body, fill, sizeof(body));
+    moq_rcbuf_t *pl = NULL;
+    R_CHECK(&t->rig, len <= sizeof(body) &&
+                         moq_rcbuf_create(&t->a.vt, body, len, &pl) == MOQ_OK);
+    DP_RETRY(&t->rig, moq_session_write_object(t->pub->peer, h, object_id, pl,
+                                               t->rig.now));
+    moq_rcbuf_decref(pl);
+}
+
+/* Group 1 after the stopped group: one small object. It must arrive -- the
+ * session and the subscription both survive the STOP. */
+static void
+stop_rig_next_group(stop_rig_t *t, int want_objects)
+{
+    moq_subgroup_cfg_t sc;
+    moq_subgroup_cfg_init(&sc);
+    sc.group_id = 1;
+    sc.subgroup_id = 0;
+    moq_subgroup_handle_t h;
+    DP_RETRY(&t->rig, moq_session_open_subgroup(t->pub->peer, t->pub_ps.up_sub,
+                                                &sc, t->rig.now, &h));
+    stop_rig_write(t, h, 0, 4, 0xB2);
+    DP_RETRY(&t->rig, moq_session_close_subgroup(t->pub->peer, h, t->rig.now));
+    for (int k = 0; k < 60 && t->sub_ps.objects < want_objects; k++) {
+        rig_pump(&t->rig, 1);
+        peer_drain(&t->rig, t->sub, &t->sub_ps, false, false, 0, 0);
+    }
+    rig_pump(&t->rig, 4);
+    peer_drain(&t->rig, t->sub, &t->sub_ps, false, false, 0, 0);
+}
+
+static int
+stop_rig_finish(stop_rig_t *t, const char *name, const char *dn)
+{
+    peer_drain(&t->rig, t->pub, &t->pub_ps, false, false, 0, 0);
+    R_CHECK(&t->rig, !t->sub_ps.session_closed);
+    R_CHECK(&t->rig, t->sub_ps.done_count == 0);   /* subscription still live */
+    R_CHECK(&t->rig, t->pub_ps.unsubscribed == 0); /* relay still upstream */
+    R_CHECK(&t->rig, t->sub_ps.last_group == 1 && t->sub_ps.last_byte == 0xB2);
+    moqr_bind_stats_t bs;
+    moqr_bind_get_stats(t->rig.bind, &bs);
+    R_CHECK(&t->rig, bs.session_errors == 0);
+    rig_destroy(&t->rig);
+    R_CHECK(&t->rig, t->a.live == 0);
+    if (t->rig.failures == 0) {
+        printf("PASS: %s %s\n", name, dn);
+    } else {
+        printf("FAIL: %s %s: relay close reason \"%s\", subscriber close 0x%llx,"
+               " SUBSCRIBE_DONE %d, objects %d, session_errors %llu,"
+               " upstream UNSUBSCRIBE %d\n",
+               name, dn, t->tr.close_reason,
+               (unsigned long long)t->sub_ps.close_code, t->sub_ps.done_count,
+               t->sub_ps.objects, (unsigned long long)bs.session_errors,
+               t->pub_ps.unsubscribed);
+    }
+    return t->rig.failures;
+}
+
+static int
+stop_rig_open_failed(stop_rig_t *t, const char *name, const char *dn)
+{
+    printf("FAIL: %s %s rig\n", name, dn);
+    if (t->created) {
+        rig_destroy(&t->rig);
+    }
+    return 1;
+}
+
+/* One object of a subgroup is written whole, the subscriber STOP_SENDINGs that
+ * stream, and only THEN does the upstream FIN seal the subgroup. The seal's
+ * close must not meet the already-reset stream as a fault: the subscriber's
+ * session stays up and group 1 arrives. */
+static int
+stop_sending_then_seal_keeps_session(moq_version_t version)
+{
+    static const char name[] = "stop_sending_then_seal_keeps_session";
+    const char *dn = version == MOQ_VERSION_DRAFT_16 ? "d16" : "d18";
+    stop_rig_t t;
+    if (!stop_rig_open(&t, version, false)) {
+        return stop_rig_open_failed(&t, name, dn);
+    }
+
+    moq_subgroup_cfg_t sc;
+    moq_subgroup_cfg_init(&sc);
+    sc.group_id = 0;
+    sc.subgroup_id = 0;
+    moq_subgroup_handle_t h;
+    DP_RETRY(&t.rig, moq_session_open_subgroup(t.pub->peer, t.pub_ps.up_sub, &sc,
+                                               t.rig.now, &h));
+    stop_rig_write(&t, h, 0, 200, 0xA1);
+    for (int k = 0; k < 60 && t.sub_ps.objects < 1; k++) {
+        rig_pump(&t.rig, 1);
+        peer_drain(&t.rig, t.sub, &t.sub_ps, false, false, 0, 0);
+    }
+    R_CHECK(&t.rig, t.sub_ps.objects == 1);         /* group 0 arrived whole */
+    R_CHECK(&t.rig, stop_rig_open_sgs(&t) == 1);    /* its stream still open */
+    stop_rig_stop(&t);                               /* ...and is given up */
+    rig_pump(&t.rig, 6);
+
+    /* The upstream FIN seals the subgroup the subscriber already stopped. */
+    DP_RETRY(&t.rig, moq_session_close_subgroup(t.pub->peer, h, t.rig.now));
+    rig_pump(&t.rig, 12);
+    peer_drain(&t.rig, t.sub, &t.sub_ps, false, false, 0, 0);
+    R_CHECK(&t.rig, stop_rig_open_sgs(&t) == 0);    /* the seal freed the slot */
+
+    stop_rig_next_group(&t, 2);
+    R_CHECK(&t.rig, t.sub_ps.objects == 2);
+    return stop_rig_finish(&t, name, dn);
+}
+
+/* The STOP lands MID-object: the upstream streams a 200-byte object in two
+ * chunks and the subscriber gives the stream up after the first, so the relay's
+ * next chunk write meets the reset stream. A second, small object of the SAME
+ * subgroup follows: it must not arrive (no new stream for a stopped subgroup),
+ * while group 1 must (the subscription goes on). */
+static int
+stop_sending_mid_object_keeps_subscription(moq_version_t version)
+{
+    static const char name[] = "stop_sending_mid_object_keeps_subscription";
+    const char *dn = version == MOQ_VERSION_DRAFT_16 ? "d16" : "d18";
+    stop_rig_t t;
+    if (!stop_rig_open(&t, version, true)) {
+        return stop_rig_open_failed(&t, name, dn);
+    }
+
+    moq_subgroup_cfg_t sc;
+    moq_subgroup_cfg_init(&sc);
+    sc.group_id = 0;
+    sc.subgroup_id = 0;
+    moq_subgroup_handle_t h;
+    DP_RETRY(&t.rig, moq_session_open_subgroup(t.pub->peer, t.pub_ps.up_sub, &sc,
+                                               t.rig.now, &h));
+    DP_RETRY(&t.rig, moq_session_begin_object(t.pub->peer, h, 0, 200, t.rig.now));
+    uint8_t half[100];
+    memset(half, 0xA1, sizeof(half));
+    moq_rcbuf_t *pl = NULL;
+    R_CHECK(&t.rig, moq_rcbuf_create(&t.a.vt, half, sizeof(half), &pl) == MOQ_OK);
+    DP_RETRY(&t.rig, moq_session_write_object_data(t.pub->peer, h, pl, t.rig.now));
+    rig_pump(&t.rig, 12);   /* the relay begins the object downstream */
+    stop_rig_stop(&t);      /* the subscriber gives the stream up mid-object */
+    rig_pump(&t.rig, 4);
+    DP_RETRY(&t.rig, moq_session_write_object_data(t.pub->peer, h, pl, t.rig.now));
+    moq_rcbuf_decref(pl);
+    DP_RETRY(&t.rig, moq_session_end_object(t.pub->peer, h, t.rig.now));
+    rig_pump(&t.rig, 12);   /* the rest of the object meets the reset stream */
+    stop_rig_write(&t, h, 1, 4, 0xC3);   /* same subgroup: must not reopen */
+    DP_RETRY(&t.rig, moq_session_close_subgroup(t.pub->peer, h, t.rig.now));
+    rig_pump(&t.rig, 12);
+    peer_drain(&t.rig, t.sub, &t.sub_ps, false, false, 0, 0);
+    R_CHECK(&t.rig, t.sub_ps.objects == 0);         /* neither group-0 object */
+    R_CHECK(&t.rig, stop_rig_open_sgs(&t) == 0);    /* the seal freed the slot */
+
+    stop_rig_next_group(&t, 1);
+    R_CHECK(&t.rig, t.sub_ps.objects == 1);         /* only group 1 */
+    return stop_rig_finish(&t, name, dn);
+}
+
 /* WOULD_BLOCK backpressure: a tiny session action queue forces the fetch writes
  * to back up; every object is still delivered exactly once, in order, across
  * pumps (the peek-holds-on-WOULD_BLOCK invariant end-to-end). */
@@ -15497,6 +15782,12 @@ main(int argc, char **argv)
     failures += chunk_liveedge_case(true);    /* abandon → downstream reset */
     failures += chunk_liveedge_evict();       /* eviction-after-stall → reset */
     failures += sub_done_resets_begun_subgroup(); /* SUB_DONE mid-object → reset */
+    /* Subscriber STOP_SENDING on one subgroup stream: session and subscription
+     * survive; the stopped subgroup is not reopened (draft-18 11.4.3). */
+    failures += stop_sending_then_seal_keeps_session(MOQ_VERSION_DRAFT_18);
+    failures += stop_sending_then_seal_keeps_session(MOQ_VERSION_DRAFT_16);
+    failures += stop_sending_mid_object_keeps_subscription(MOQ_VERSION_DRAFT_18);
+    failures += stop_sending_mid_object_keeps_subscription(MOQ_VERSION_DRAFT_16);
     /* Retained FETCH over chunked COMPLETE records —
      * parity with whole-object storage across d16/d18 + a backpressure variant. */
     failures += retained_fetch_representation_parity_oracle(MOQ_VERSION_DRAFT_18, 0);

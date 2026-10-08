@@ -77,6 +77,11 @@ typedef struct b_sg {
     bool                  obj_begun;
     uint64_t              obj_id;
     uint32_t              next_chunk;
+    /* The subscriber gave this subgroup up: its STOP_SENDING made the session
+     * reset the stream on its own (bind_sg_stopped). Nothing more is written
+     * on it and it is never reopened; the slot is held until the subgroup's
+     * seal so a later record of the same subgroup finds it and is skipped. */
+    bool                  peer_stopped;
 } b_sg_t;
 
 /* A downstream FETCH being served from a core fetch cursor. State machine:
@@ -489,6 +494,33 @@ bind_dl_rearm_on_slot_release(moqr_bind_t *b, const b_conn_t *cn)
     if (cn->bind_sg_waiting) {
         bind_dl_rearm(b, cn);
     }
+}
+
+/* draft-ietf-moq-transport-18 Section 11.4.3: "A subscriber MAY send a QUIC
+ * STOP_SENDING frame for a subgroup stream if the Group or Subgroup is no
+ * longer of interest to it. The publisher SHOULD respond with a reset." The
+ * downstream session does exactly that on its own (moq_session_on_data_stop)
+ * without telling the binding, so a later write, close or reset on the slot
+ * fails although nothing is wrong: the stream's terminal is already on its way.
+ * Called after such a failure: true -- the slot marked peer_stopped -- when
+ * the session says the subgroup is gone; false for a real fault, which the
+ * caller still fails closed. Per the same section the STOP has "no impact on
+ * other Subgroups in the Group or the subscription", and the publisher "SHOULD
+ * NOT attempt to open a new stream to deliver additional Objects in that
+ * Subgroup": so the subscription goes on, and the slot is kept (a later record
+ * of the subgroup finds it and is skipped) until the subgroup's seal. */
+static bool
+bind_sg_stopped(b_conn_t *cn, b_sg_t *sg)
+{
+    if (sg->peer_stopped) {
+        return true;
+    }
+    if (!moq_session_subgroup_gone(cn->session, sg->h)) {
+        return false;
+    }
+    sg->peer_stopped = true;
+    sg->obj_begun = false;
+    return true;
 }
 
 static void
@@ -3645,6 +3677,12 @@ bind_try_intent(moqr_bind_t *b, const moqr_intent_t *it, uint64_t now_us,
             if (!cn->sgs[i].used || cn->sgs[i].sub_raw != it->cookie) {
                 continue;
             }
+            if (cn->sgs[i].peer_stopped) {
+                /* Already reset on the subscriber's STOP_SENDING. */
+                cn->sgs[i].used = false;
+                bind_dl_rearm_on_slot_release(b, cn);
+                continue;
+            }
             moq_result_t crc;
             if (cn->sgs[i].obj_begun) {
                 /* A begun object cannot be FIN-closed: close_subgroup returns
@@ -3673,7 +3711,8 @@ bind_try_intent(moqr_bind_t *b, const moqr_intent_t *it, uint64_t now_us,
                 *defer = *it;
                 return false;
             }
-            if (cn->sgs[i].obj_begun && crc != MOQ_OK) {
+            if (cn->sgs[i].obj_begun && crc != MOQ_OK &&
+                !bind_sg_stopped(cn, &cn->sgs[i])) {
                 /* A hard reset failure leaves the begun object unterminated:
                  * fail closed rather than strand it. */
                 b->session_errors++;
@@ -5072,7 +5111,9 @@ bind_write_chunked(moqr_bind_t *b, b_conn_t *cn, const moqr_delivery_t *d,
             return MOQR_DELIVERY_WOULD_BLOCK;   /* subgroup stays OPEN, retry */
         }
         if (brc != MOQ_OK) {
-            return MOQR_DELIVERY_STREAM_ERROR;
+            /* A stream the subscriber stopped: skip, keep the subscription. */
+            return bind_sg_stopped(cn, sg) ? MOQR_DELIVERY_ABANDONED
+                                           : MOQR_DELIVERY_STREAM_ERROR;
         }
         sg->obj_begun = true;
         sg->obj_id = d->rec.object_id;
@@ -5104,7 +5145,8 @@ bind_write_chunked(moqr_bind_t *b, b_conn_t *cn, const moqr_delivery_t *d,
             return MOQR_DELIVERY_WOULD_BLOCK;
         }
         if (wrc != MOQ_OK) {
-            return MOQR_DELIVERY_STREAM_ERROR;
+            return bind_sg_stopped(cn, sg) ? MOQR_DELIVERY_ABANDONED
+                                           : MOQR_DELIVERY_STREAM_ERROR;
         }
         sg->next_chunk++;
     }
@@ -5117,7 +5159,9 @@ bind_write_chunked(moqr_bind_t *b, b_conn_t *cn, const moqr_delivery_t *d,
     }
     moq_result_t erc = moq_session_end_object(cn->session, sg->h, now_us);
     if (erc != MOQ_OK) {
-        return MOQR_DELIVERY_STREAM_ERROR;   /* end_object never WOULD_BLOCKs */
+        /* end_object never WOULD_BLOCKs */
+        return bind_sg_stopped(cn, sg) ? MOQR_DELIVERY_ABANDONED
+                                       : MOQR_DELIVERY_STREAM_ERROR;
     }
     sg->obj_begun = false;   /* object complete; the slot can begin the next */
     return MOQR_DELIVERY_DELIVERED;
@@ -5233,6 +5277,16 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
                         : cn->sgs[i].group >= d.oldest_group) {
                     continue;
                 }
+                if (cn->sgs[i].peer_stopped) {
+                    /* Already reset on the subscriber's STOP_SENDING: no FIN
+                     * or reset is owed, the slot just goes. */
+                    cn->sgs[i].used = false;
+                    bind_dl_rearm_on_slot_release(b, cn);
+                    if (d.notice == MOQR_DELIVERY_NOTICE_SEAL) {
+                        break;   /* a seal names exactly one subgroup */
+                    }
+                    continue;
+                }
                 /* A reset-flavored seal closes abnormally, forwarding the
                  * upstream RESET code — the subgroup's content is truncated
                  * at the source, and a clean FIN would misrepresent it as
@@ -5259,7 +5313,7 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
                     blocked = true;
                     break;
                 }
-                if (crc != MOQ_OK) {
+                if (crc != MOQ_OK && !bind_sg_stopped(cn, &cn->sgs[i])) {
                     faulted = true;
                     break;
                 }
@@ -5353,7 +5407,7 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
                         blocked = true;
                         break;
                     }
-                    if (rrc != MOQ_OK) {
+                    if (rrc != MOQ_OK && !bind_sg_stopped(cn, &cn->sgs[i])) {
                         faulted = true;
                         break;
                     }
@@ -5377,6 +5431,13 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
                     }
                     return B_DELIVER_BLOCKED_ACTION_CAP;
                 }
+                oc = MOQR_DELIVERY_ABANDONED;
+            } else if (d.rec.obj_state == MOQR_OBJ_ABANDONED && sgi >= 0 &&
+                       cn->sgs[sgi].peer_stopped) {
+                /* The subscriber gave this subgroup up and its stream was
+                 * reset then: there is no begun object left to terminate. */
+                cn->sgs[sgi].used = false;
+                bind_dl_rearm_on_slot_release(b, cn);
                 oc = MOQR_DELIVERY_ABANDONED;
             } else if (d.rec.obj_state == MOQR_OBJ_ABANDONED) {
                 /* Abandoned head, selected only because this sub already began
@@ -5419,7 +5480,7 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
                     }
                     return B_DELIVER_BLOCKED_ACTION_CAP;
                 }
-                if (rrc != MOQ_OK) {
+                if (rrc != MOQ_OK && !bind_sg_stopped(cn, &cn->sgs[sgi])) {
                     /* Reset could not be put on the wire: fail closed — the peer
                      * must see a terminal for the begun object, so terminate the
                      * connection (its close IS the terminal). */
@@ -5433,6 +5494,10 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
                 cn->sgs[sgi].used = false;   /* reset shipped: stream finished */
                 cn->sgs[sgi].obj_begun = false;
                 bind_dl_rearm_on_slot_release(b, cn);
+                oc = MOQR_DELIVERY_ABANDONED;
+            } else if (sgi >= 0 && cn->sgs[sgi].peer_stopped) {
+                /* The subscriber stopped this subgroup: no write and no new
+                 * stream for it (bind_sg_stopped); the subscription goes on. */
                 oc = MOQR_DELIVERY_ABANDONED;
             } else {
                 if (sgi < 0) {
@@ -5540,6 +5605,7 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
                     cn->sgs[sgi].obj_begun = false;   /* fresh write progress  */
                     cn->sgs[sgi].obj_id = 0;
                     cn->sgs[sgi].next_chunk = 0;
+                    cn->sgs[sgi].peer_stopped = false;
                 }
                 if (d.rec.chunk_count > 0) {
                     /* Chunked record: stream the batch. Returns DELIVERED after
@@ -5547,17 +5613,25 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
                      * WOULD_BLOCK to hold, or STREAM_ERROR. */
                     oc = bind_write_chunked(b, cn, &d, &cn->sgs[sgi], now_us);
                 } else if (d.rec.payload == NULL) {
-                    oc = oc_from_result(moq_session_write_status_object(
+                    moq_result_t wrc = moq_session_write_status_object(
                         cn->session, cn->sgs[sgi].h, d.rec.object_id,
-                        (moq_object_status_t)d.rec.status, now_us));
+                        (moq_object_status_t)d.rec.status, now_us);
+                    oc = wrc != MOQ_OK && wrc != MOQ_ERR_WOULD_BLOCK &&
+                                 bind_sg_stopped(cn, &cn->sgs[sgi])
+                             ? MOQR_DELIVERY_ABANDONED
+                             : oc_from_result(wrc);
                 } else {
                     moq_object_cfg_t ocfg;
                     moq_object_cfg_init(&ocfg);
                     ocfg.object_id = d.rec.object_id;
                     ocfg.payload = (moq_rcbuf_t *)(void *)d.rec.payload;
                     ocfg.properties = (moq_rcbuf_t *)(void *)d.rec.properties;
-                    oc = oc_from_result(moq_session_write_object_ex(
-                        cn->session, cn->sgs[sgi].h, &ocfg, now_us));
+                    moq_result_t wrc = moq_session_write_object_ex(
+                        cn->session, cn->sgs[sgi].h, &ocfg, now_us);
+                    oc = wrc != MOQ_OK && wrc != MOQ_ERR_WOULD_BLOCK &&
+                                 bind_sg_stopped(cn, &cn->sgs[sgi])
+                             ? MOQR_DELIVERY_ABANDONED
+                             : oc_from_result(wrc);
                 }
                 /* NO inline graceful close here — every graceful subgroup
                  * closure rides the acknowledged SEAL notice, whose close

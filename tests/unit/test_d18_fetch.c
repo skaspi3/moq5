@@ -1205,6 +1205,67 @@ int main(void)
         moq_session_destroy(s);
     }
 
+    /* == U. Fetcher: the publisher's FIN on the request bidi after the fetch
+     *       completed ==================================================
+     *
+     * §5.2: the fetcher keeps FETCH state until the data stream FINs, and the
+     * publisher may close its half of the request bidi after that. There is no
+     * ordering across streams, so the bidi's empty FIN can arrive after the data
+     * uni's FIN has already completed the fetch and freed its entry. That FIN
+     * ends a request we finished; it must not close the session. */
+    {
+        moq_session_t *s = make_established_d18_client();
+        MOQ_TEST_CHECK(s != NULL);
+        moq_fetch_t h = { 0 };
+        moq_stream_ref_t ref = do_fetch(s, "video", &h, NULL);
+
+        /* FETCH_OK on the request bidi, no FIN yet. */
+        uint8_t ok[64];
+        moq_buf_writer_t w;
+        moq_buf_writer_init(&w, ok, sizeof(ok));
+        moq_d18_encode_fetch_ok(&w, false, (moq_d18_location_t){ 10, 0 },
+                                (moq_bytes_t){0});
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_session_on_bidi_stream_bytes(s, ref, ok,
+                moq_buf_writer_offset(&w), false, 1), (int)MOQ_OK);
+        MOQ_TEST_CHECK(drain_kind(s, MOQ_EVENT_FETCH_OK) == 1);
+        moq_request_endpoint_t ep = request_registry_find_by_streamref(s, ref);
+        MOQ_TEST_CHECK_EQ_INT((int)ep.kind, (int)MOQ_REQ_FETCH);
+        uint64_t req_id = s->fetches[ep.slot].request_id;
+
+        /* The data uni: FETCH_HEADER and FIN (no objects in range). The fetch
+         * completes and its entry is freed. */
+        uint8_t hdr[16];
+        moq_buf_writer_init(&w, hdr, sizeof(hdr));
+        MOQ_TEST_CHECK(moq_d18_encode_fetch_header(&w, req_id) == MOQ_OK);
+        moq_stream_ref_t duni = moq_stream_ref_from_u64(0xD002);
+        MOQ_TEST_CHECK(moq_session_on_data_bytes(
+            s, duni, hdr, moq_buf_writer_offset(&w), true, 2) >= 0);
+        MOQ_TEST_CHECK(drain_kind(s, MOQ_EVENT_FETCH_COMPLETE) == 1);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)request_registry_find_by_streamref(s, ref).kind,
+            (int)MOQ_REQ_NONE);
+
+        /* Then the publisher's empty FIN on the request bidi. */
+        moq_result_t rc = moq_session_on_bidi_stream_bytes(s, ref, NULL, 0,
+                                                           true, 3);
+        if (s->state == MOQ_SESS_CLOSED) {
+            moq_event_t ev;
+            while (moq_session_poll_events(s, &ev, 1) > 0) {
+                if (ev.kind == MOQ_EVENT_SESSION_CLOSED)
+                    fprintf(stderr, "  session closed: code 0x%llx \"%.*s\"\n",
+                            (unsigned long long)ev.u.closed.code,
+                            (int)ev.u.closed.reason.len,
+                            ev.u.closed.reason.data
+                                ? (const char *)ev.u.closed.reason.data : "");
+                moq_event_cleanup(&ev);
+            }
+        }
+        MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
+        moq_session_destroy(s);
+    }
+
     if (!failures) MOQ_TEST_PASS("d18_fetch");
     return failures != 0;
 }

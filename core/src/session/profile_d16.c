@@ -2221,6 +2221,16 @@ static moq_result_t d16_decode_publish_done_inbound(
     }
     if (ep.kind != MOQ_REQ_PUBLISH) {
         *out_consumed = true;
+        /* One of OUR earlier requests (our parity, below our next id) that is
+         * already gone: we sent UNSUBSCRIBE (§5.1.1 lets the subscriber drop
+         * its state right then) while the publisher's PUBLISH_DONE was in
+         * flight. The two crossed; absorb it. An id we never issued is still
+         * a violation. */
+        const moq_d16_profile_state_t *d16 =
+            (const moq_d16_profile_state_t *)s->profile_state;
+        if (((done.request_id ^ d16->next_local_request_id) & 1u) == 0 &&
+            done.request_id < d16->next_local_request_id)
+            return MOQ_OK;
         return close_with_error(s, 0x3, "PUBLISH_DONE for unknown request");
     }
 

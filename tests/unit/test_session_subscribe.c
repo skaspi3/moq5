@@ -3078,6 +3078,100 @@ int main(void)
         MOQ_TEST_CHECK(as.balance == 0);
     }
 
+    /* -- Outbound UNSUBSCRIBE: late PUBLISH_DONE after unsub ----------- *
+     * §5.1.1: the subscriber drops its state when it sends UNSUBSCRIBE. A
+     * PUBLISH_DONE the publisher sent before it saw the UNSUBSCRIBE then
+     * arrives for a request id we no longer track. The two crossed; the
+     * session must stay open. A PUBLISH_DONE for an id we never issued is
+     * still a violation. */
+    {
+        test_alloc_state_t as = {0};
+        moq_alloc_t alloc = test_allocator(&as);
+        moq_session_t *c = NULL, *sv = NULL;
+        establish_pair(&alloc, 10, 10, &c, &sv, NULL, NULL);
+        moq_event_t ev;
+        if (moq_session_poll_events(c, &ev, 1) == 1) moq_event_cleanup(&ev);
+        if (moq_session_poll_events(sv, &ev, 1) == 1) moq_event_cleanup(&ev);
+
+        moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("ns") };
+        moq_namespace_t ns = { ns_parts, 1 };
+        moq_subscribe_cfg_t sub_cfg;
+        moq_subscribe_cfg_init(&sub_cfg);
+        sub_cfg.track_namespace = ns;
+        sub_cfg.track_name = MOQ_BYTES_LITERAL("t");
+        sub_cfg.filter = MOQ_SUBSCRIBE_FILTER_NEXT_GROUP;
+        moq_subscription_t csub;
+        MOQ_TEST_CHECK(moq_session_subscribe(c, &sub_cfg, 0, &csub) == MOQ_OK);
+        pump_actions_to_peer(c, sv, 0);
+
+        MOQ_TEST_CHECK(moq_session_poll_events(sv, &ev, 1) == 1);
+        MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST);
+        moq_subscription_t ssub = ev.u.subscribe_request.sub;
+        moq_event_cleanup(&ev);
+
+        moq_accept_subscribe_cfg_t acc;
+        moq_accept_subscribe_cfg_init(&acc);
+        MOQ_TEST_CHECK(moq_session_accept_subscribe(sv, ssub, &acc, 0)
+            == MOQ_OK);
+        pump_actions_to_peer(sv, c, 0);
+        MOQ_TEST_CHECK(moq_session_poll_events(c, &ev, 1) == 1);
+        MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_SUBSCRIBE_OK);
+        moq_event_cleanup(&ev);
+
+        /* Established. The client unsubscribes (UNSUBSCRIBE queued, not yet
+         * delivered) while the server ends the subscription. */
+        MOQ_TEST_CHECK(moq_session_unsubscribe(c, csub, 0) == MOQ_OK);
+        moq_done_subscribe_cfg_t dcfg;
+        moq_done_subscribe_cfg_init(&dcfg);
+        dcfg.status_code = 0x2;   /* TRACK_ENDED */
+        MOQ_TEST_CHECK(moq_session_done_subscribe(sv, ssub, &dcfg, 0)
+            == MOQ_OK);
+
+        /* The PUBLISH_DONE reaches the client after its UNSUBSCRIBE. */
+        pump_actions_to_peer(sv, c, 0);
+        if (moq_session_state(c) == MOQ_SESS_CLOSED) {
+            moq_event_t evts[4]; size_t ne;
+            while ((ne = moq_session_poll_events(c, evts, 4)) > 0)
+                for (size_t i = 0; i < ne; i++) {
+                    if (evts[i].kind == MOQ_EVENT_SESSION_CLOSED)
+                        fprintf(stderr,
+                            "  client closed: code 0x%llx \"%.*s\"\n",
+                            (unsigned long long)evts[i].u.closed.code,
+                            (int)evts[i].u.closed.reason.len,
+                            evts[i].u.closed.reason.data
+                                ? (const char *)evts[i].u.closed.reason.data
+                                : "");
+                    moq_event_cleanup(&evts[i]);
+                }
+        }
+        MOQ_TEST_CHECK(moq_session_state(c) == MOQ_SESS_ESTABLISHED);
+
+        /* An id of ours we never issued (next one up) still closes. */
+        if (moq_session_state(c) == MOQ_SESS_ESTABLISHED) {
+            uint8_t db[64]; moq_buf_writer_t dw;
+            moq_buf_writer_init(&dw, db, sizeof(db));
+            MOQ_TEST_CHECK(moq_d16_encode_publish_done(&dw, 2, 0x2, 0,
+                NULL, 0) == MOQ_OK);
+            moq_session_on_control_bytes(c, db, moq_buf_writer_offset(&dw), 0);
+            MOQ_TEST_CHECK(moq_session_state(c) == MOQ_SESS_CLOSED);
+        }
+
+        { moq_event_t evts[4]; size_t ne;
+          while ((ne = moq_session_poll_events(sv, evts, 4)) > 0)
+              for (size_t i = 0; i < ne; i++) moq_event_cleanup(&evts[i]);
+          while ((ne = moq_session_poll_events(c, evts, 4)) > 0)
+              for (size_t i = 0; i < ne; i++) moq_event_cleanup(&evts[i]);
+          moq_action_t acts[4]; size_t na;
+          while ((na = moq_session_poll_actions(sv, acts, 4)) > 0)
+              for (size_t i = 0; i < na; i++) moq_action_cleanup(&acts[i]);
+          while ((na = moq_session_poll_actions(c, acts, 4)) > 0)
+              for (size_t i = 0; i < na; i++) moq_action_cleanup(&acts[i]);
+        }
+        moq_session_destroy(c);
+        moq_session_destroy(sv);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+
     /* -- REQUEST_UPDATE: basic priority update ------------------------- */
     {
         test_alloc_state_t as = {0};

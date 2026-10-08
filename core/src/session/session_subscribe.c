@@ -1426,10 +1426,11 @@ moq_result_t handle_request_stream_bytes(moq_session_t *s,
          * the terminal. */
         int car = noslot_carrier_find(s, stream_ref);
         if (car < 0) {
-            if (len == 0 && !fin) return MOQ_OK;
-            if (len == 0 && fin)
-                return close_with_error(s, 0x3,
-                    "empty FIN on request stream without request");
+            /* An empty FIN on a request stream we no longer track: the peer
+             * closing its half after a request that is already finished here
+             * (e.g. a FETCH whose FETCH_OK and data stream we took). Nothing
+             * to do. */
+            if (len == 0) return MOQ_OK;
             /* Reserve a slot to buffer the inbound request. */
             slot = sub_find_free(s);
         }

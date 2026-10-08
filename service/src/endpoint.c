@@ -284,14 +284,22 @@ moq_result_t moq_endpoint_resolve_cfg(const moq_endpoint_cfg_t *cfg,
      * (an SNI mismatch already cost a debug round -- §5.1). */
     out->sni = bytes_empty(cfg->sni) ? out->url.host : cfg->sni;
 
-    /* WT path: WEBTRANSPORT only. Explicit value, else the URL path, else
-     * "/moq". RAW_QUIC leaves it empty (the URL path is carried in the
+    /* WT path: WEBTRANSPORT only. Explicit value, else the URL path and
+     * query, else "/moq". RAW_QUIC leaves it empty (the URL path is carried in the
      * PATH setup option there, which the endpoint does not emit yet). */
     if (out->protocol == MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT) {
         if (!bytes_empty(cfg->wt_path)) {
             out->wt_path = cfg->wt_path;
         } else if (out->url.path.len > 0) {
+            /* The path WITH its query: the query is part of the CONNECT
+             * target (relays take auth tokens there). Path and query are
+             * adjacent in cfg->url, so this is one span. A query on an empty
+             * path ("https://h?x") still falls back to "/moq" below. */
             out->wt_path = out->url.path;
+            if (out->url.query.data)
+                out->wt_path.len = (size_t)(out->url.query.data +
+                                            out->url.query.len -
+                                            out->url.path.data);
         } else {
             static const uint8_t k_default_path[] = "/moq";
             out->wt_path.data = k_default_path;

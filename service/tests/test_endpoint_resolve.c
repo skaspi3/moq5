@@ -609,6 +609,10 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
         MOQ_TEST_CHECK(bytes_eq(r.wt_path, "/live/room1"));
 
+        c = mkcfg("https://relay.example/moq?jwt=abc");   /* query kept */
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK(bytes_eq(r.wt_path, "/moq?jwt=abc"));
+
         c = mkcfg("https://relay.example");
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
         MOQ_TEST_CHECK(bytes_eq(r.wt_path, "/moq"));

@@ -3028,7 +3028,8 @@ bool moq_session_can_admit_data_stream(const moq_session_t *s)
  * the PEER's terminal still owed here? This excludes a live request-registry
  * owner -- a local-origin request bidi the app itself FIN'd must retire even
  * while its owner lingers awaiting a response -- but keeps the peer-origin
- * receive paths and the two #245 peer-terminal-awaiting signals. */
+ * receive paths, a pending draft-18 TRACK_STATUS (below), and the two #245
+ * peer-terminal-awaiting signals. */
 bool moq_session_stream_awaits_peer_terminal(const moq_session_t *s,
                                              moq_stream_ref_t ref)
 {
@@ -3042,6 +3043,22 @@ bool moq_session_stream_awaits_peer_terminal(const moq_session_t *s,
         return true;
     if (moq_index_find(s->idx_ns_by_ref, s->idx_ns_mask, ref._v) >= 0)
         return true;
+    /* A draft-18 TRACK_STATUS we asked. The session, not the app, FINs the
+     * request bidi together with the request (it is the only message), so our
+     * send half is closed from the start -- yet TRACK_STATUS_OK / REQUEST_ERROR
+     * is owed on this very stream (PENDING_REQUESTER), and after it the peer's
+     * FIN, on which the request-stream handler frees the entry
+     * (DRAINING_RESPONSE). Retiring the stream here tombstones it, and the
+     * answer then fails the connection as bytes on a tombstoned stream. */
+    {
+        const moq_request_endpoint_t ep =
+            request_registry_find_by_streamref(s, ref);
+        if (ep.kind == MOQ_REQ_TRACK_STATUS && ep.slot >= 0 &&
+            (size_t)ep.slot < s->ts_cap &&
+            (s->track_statuses[ep.slot].state == MOQ_TS_PENDING_REQUESTER ||
+             s->track_statuses[ep.slot].state == MOQ_TS_DRAINING_RESPONSE))
+            return true;
+    }
     if (noslot_carrier_find(s, ref) >= 0)
         return true;
     if (drain_ref_contains(s, ref))

@@ -588,6 +588,130 @@ static moq_result_t d18_server_subscribe(test_pair_t *tp)
 }
 
 /*
+ * A draft-18 TRACK_STATUS round trip through both bridges, the CLIENT asking.
+ * The session opens the request bidi with TRACK_STATUS and FIN together (it is
+ * the request's only message), so the client's send half is closed before the
+ * answer comes back on that same stream. The bridge must keep that stream until
+ * the answer and the server's FIN have arrived: tombstoning it made the
+ * TRACK_STATUS_OK read as "bidi bytes on a tombstoned stream", and the client
+ * closed the whole session with PROTOCOL_VIOLATION (0x3).
+ */
+static int test_d18_track_status_client_roundtrip(void)
+{
+    int failures = 0;
+
+    test_pair_t tp;
+    if (d18_pair_init(&tp, 0) < 0) return failures + 1;
+    moq_session_start(tp.client, 0);
+    moq_session_start(tp.server, 0);
+    d18_shuttle_until_quiescent(&tp, 30, 0);
+    moq_event_t ev;
+    while (moq_session_poll_events(tp.client, &ev, 1) > 0) moq_event_cleanup(&ev);
+    while (moq_session_poll_events(tp.server, &ev, 1) > 0) moq_event_cleanup(&ev);
+    MOQ_TEST_CHECK(moq_session_state(tp.client) == MOQ_SESS_ESTABLISHED);
+
+    moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("live") };
+    moq_track_status_cfg_t tc;
+    moq_track_status_cfg_init(&tc);
+    tc.track_namespace = (moq_namespace_t){ ns_parts, 1 };
+    tc.track_name = MOQ_BYTES_LITERAL("video");
+    const size_t streams_before =
+        moq_transport_bridge_stream_count(tp.client_bridge);
+    moq_track_status_handle_t ch;
+    MOQ_TEST_CHECK(moq_session_track_status(tp.client, &tc, 0, &ch) == MOQ_OK);
+    d18_shuttle_until_quiescent(&tp, 30, 0);
+    /* Request and FIN are out; the answer is still owed on this stream, so the
+     * client must not have tombstoned it. */
+    MOQ_TEST_CHECK(moq_transport_bridge_tombstone_count(tp.client_bridge) == 0);
+
+    bool got_request = false;
+    moq_track_status_handle_t sh = { 0 };
+    while (moq_session_poll_events(tp.server, &ev, 1) > 0) {
+        if (ev.kind == MOQ_EVENT_TRACK_STATUS_REQUEST) {
+            got_request = true;
+            sh = ev.u.track_status_request.handle;
+        }
+        moq_event_cleanup(&ev);
+    }
+    MOQ_TEST_CHECK(got_request);
+    moq_accept_track_status_cfg_t ac;
+    moq_accept_track_status_cfg_init(&ac);
+    ac.has_largest = true;
+    ac.largest_group = 7;
+    ac.largest_object = 3;
+    MOQ_TEST_CHECK(moq_session_accept_track_status(tp.server, sh, &ac, 0) ==
+                   MOQ_OK);
+
+    /* The answer returns on the client's OWN bidi (client range 2000..2999).
+     * Deliver the server's writes on it by hand: the bytes first, the FIN held
+     * back, so the stream sits between the answer and the FIN. */
+    uint64_t ans_sid = 0;
+    bool fin_held = false;
+    for (int round = 0; round < 10; round++) {
+        held_bridge_service(tp.server_bridge, 0);
+        if (tp.server_ep.count == 0) break;
+        for (size_t i = 0; i < tp.server_ep.count; i++) {
+            fake_op_t *o = &tp.server_ep.ops[i];
+            if (o->kind != FAKE_OP_WRITE) continue;
+            if (o->stream_id < 2000 || o->stream_id >= 3000) continue;
+            ans_sid = o->stream_id;
+            if (o->data_len > 0) {
+                moq_result_t rc = moq_transport_bridge_on_peer_bidi_bytes(
+                    tp.client_bridge, o->stream_id, o->data, o->data_len,
+                    false, 0);
+                if (rc != MOQ_OK)
+                    fprintf(stderr, "  TRACK_STATUS_OK on stream %llu: rc=%d, "
+                            "client bridge fatal=%d code=0x%llx\n",
+                            (unsigned long long)o->stream_id, (int)rc,
+                            (int)moq_transport_bridge_is_fatal(tp.client_bridge),
+                            (unsigned long long)moq_transport_bridge_fatal_code(
+                                tp.client_bridge));
+                MOQ_TEST_CHECK(rc == MOQ_OK);
+            }
+            if (o->fin) fin_held = true;
+        }
+        fake_endpoint_clear_ops(&tp.server_ep);
+        held_bridge_service(tp.client_bridge, 0);
+    }
+    MOQ_TEST_CHECK(ans_sid != 0 && fin_held);
+
+    /* The answer is delivered and the session survives it. */
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(tp.client_bridge));
+    MOQ_TEST_CHECK(moq_session_state(tp.client) == MOQ_SESS_ESTABLISHED);
+    bool got_ok = false;
+    while (moq_session_poll_events(tp.client, &ev, 1) > 0) {
+        if (ev.kind == MOQ_EVENT_TRACK_STATUS_OK) {
+            got_ok = true;
+            MOQ_TEST_CHECK(ev.u.track_status_ok.has_largest);
+            MOQ_TEST_CHECK(ev.u.track_status_ok.largest_group == 7);
+            MOQ_TEST_CHECK(ev.u.track_status_ok.largest_object == 3);
+        }
+        moq_event_cleanup(&ev);
+    }
+    MOQ_TEST_CHECK(got_ok);
+    /* Answered, FIN still owed: the stream is kept, not tombstoned. */
+    MOQ_TEST_CHECK(moq_transport_bridge_tombstone_count(tp.client_bridge) == 0);
+
+    /* The server's FIN then reaches the request-stream handler, which frees
+     * the entry and the stream: nothing leaks, nothing was tombstoned. */
+    MOQ_TEST_CHECK(moq_transport_bridge_on_peer_bidi_bytes(
+        tp.client_bridge, ans_sid, NULL, 0, true, 0) == MOQ_OK);
+    held_bridge_service(tp.client_bridge, 0);
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(tp.client_bridge));
+    MOQ_TEST_CHECK(moq_transport_bridge_tombstone_count(tp.client_bridge) == 0);
+    size_t live_ts = 0;
+    for (size_t i = 0; i < tp.client->ts_cap; i++)
+        if (tp.client->track_statuses[i].state != MOQ_TS_FREE) live_ts++;
+    MOQ_TEST_CHECK(live_ts == 0);
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_count(tp.client_bridge) ==
+                   streams_before);
+
+    test_pair_destroy(&tp);
+    MOQ_TEST_PASS("d18_track_status_client_roundtrip");
+    return failures;
+}
+
+/*
  * Subscribed client with its single event slot already occupied, plus the
  * server-side subgroup whose wire bytes the per-family tests deliver.
  *
@@ -14017,6 +14141,8 @@ int main(void)
 #ifdef MOQ_BRIDGE_SCAN_COUNTERS
     failures += test_hol_scan_operation_counts();
 #endif
+
+    failures += test_d18_track_status_client_roundtrip();
 
     /* terminal facts */
     failures += test_terminal_facts_enqueued_then_observed();

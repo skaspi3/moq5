@@ -23,8 +23,10 @@ bool moq_session_uses_uni_control(const moq_session_t *s);
 /*
  * True when the session still needs the PEER's terminal (FIN/RESET) on this
  * bidi stream after our own send half has closed -- i.e. a peer-origin
- * receive path, a locally-terminated request bidi in the drain ring, or a
- * no-slot admission carrier awaiting its terminal. This is deliberately
+ * receive path, a locally-terminated request bidi in the drain ring, a
+ * draft-18 TRACK_STATUS still awaiting its answer or the peer's FIN (the
+ * session FINs that request bidi with the request itself), or a no-slot
+ * admission carrier awaiting its terminal. This is deliberately
  * NARROWER than moq_session_has_transport_stream(), which additionally
  * recognises a live request-registry owner for retainability (#245a): a
  * local-origin request bidi we ourselves FIN'd must still retire even though

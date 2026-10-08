@@ -423,6 +423,8 @@ typedef struct peer_state {
     int                objects;   /* objects delivered to this peer        */
     uint64_t           last_group;
     uint64_t           last_object;
+    int                first_objects;   /* objects flagged FIRST_OBJECT        */
+    uint64_t           first_object_id; /* the last such object's id          */
     uint8_t            last_byte;
     size_t             last_len;      /* reassembled payload length            */
     int                chunks;        /* OBJECT_CHUNK data chunks received      */
@@ -667,6 +669,10 @@ peer_drain(rig_t *r, conn_t *cn, peer_state_t *ps, bool auto_accept,
                 }
                 ps->last_group = ev->u.object_received.group_id;
                 ps->last_object = ev->u.object_received.object_id;
+                if (ev->u.object_received.first_object) {
+                    ps->first_objects++;
+                    ps->first_object_id = ev->u.object_received.object_id;
+                }
                 ps->last_datagram = ev->u.object_received.datagram;
                 ps->last_status = ev->u.object_received.status;
                 ps->last_payload_null =
@@ -8043,6 +8049,196 @@ chunk_liveedge_evict(void)
     R_CHECK(&rig, a.live == 0);
     if (rig.failures == 0) {
         printf("PASS: chunk_liveedge_evict\n");
+    }
+    return rig.failures;
+}
+
+/* ---- FIRST_OBJECT forwarding (draft-18 section 2.2) ------------------------- *
+ * "A relay forwarding a subgroup that begins with the first object ever
+ * published in that subgroup MUST set the FIRST_OBJECT bit." The publisher
+ * opens group 0 from its start with the bit. A subscriber whose stream starts
+ * with object 0 sees it in the SUBGROUP_HEADER type (0x54) and on that first
+ * object only; a subscriber that joins after object 0 (Largest Object filter:
+ * its stream starts at object 1) does not (0x14). Draft-16 has no such bit: a
+ * draft-16 publisher cannot carry it and a draft-16 subscriber never sees it.
+ * The SimPair trace keeps the type of each data stream's first SEND_DATA (the
+ * SUBGROUP_HEADER), per pair and direction. */
+typedef struct fo_tap {
+    struct {
+        uint64_t          seed, ref;
+        moq_perspective_t from;
+        uint8_t           type;
+    } s[16];
+    int n;
+} fo_tap_t;
+
+static void
+fo_trace_fn(void *ctx, const moq_sim_trace_record_t *r)
+{
+    fo_tap_t *t = (fo_tap_t *)ctx;
+    if (r->kind != MOQ_SIM_TRACE_ACTION ||
+        r->action_kind != MOQ_ACTION_SEND_DATA || r->bytes.len == 0 ||
+        r->struct_size < offsetof(moq_sim_trace_record_t, stream_ref) +
+                             sizeof(r->stream_ref)) {
+        return;
+    }
+    for (int i = 0; i < t->n; i++) {
+        if (t->s[i].seed == r->seed && t->s[i].from == r->from &&
+            t->s[i].ref == r->stream_ref._v) {
+            return;   /* not the stream's first write */
+        }
+    }
+    if (t->n == 16) {
+        return;
+    }
+    t->s[t->n].seed = r->seed;
+    t->s[t->n].ref = r->stream_ref._v;
+    t->s[t->n].from = r->from;
+    t->s[t->n].type = r->bytes.data[0];   /* < 0x80: one byte in both drafts */
+    t->n++;
+}
+
+/* The header type of the only data stream `from` opened on cn's pair; 0 when
+ * there is not exactly one. */
+static uint8_t
+fo_type(const fo_tap_t *t, const rig_t *r, const conn_t *cn,
+        moq_perspective_t from)
+{
+    uint64_t seed = 0x5EED0000u + (uint64_t)(cn - r->conns);
+    int found = 0;
+    uint8_t type = 0;
+    for (int i = 0; i < t->n; i++) {
+        if (t->s[i].seed == seed && t->s[i].from == from) {
+            found++;
+            type = t->s[i].type;
+        }
+    }
+    return found == 1 ? type : 0;
+}
+
+static int
+first_object_forwarded(moq_version_t pub_v, moq_version_t sub_v)
+{
+    const bool both18 = pub_v == MOQ_VERSION_DRAFT_18 &&
+                        sub_v == MOQ_VERSION_DRAFT_18;
+    const char *pn = pub_v == MOQ_VERSION_DRAFT_16 ? "d16" : "d18";
+    const char *sn = sub_v == MOQ_VERSION_DRAFT_16 ? "d16" : "d18";
+    ca_t a;
+    ca_init(&a);
+    rig_t rig;
+    if (rig_create(&rig, &a) != MOQR_OK) {
+        printf("FAIL: first_object_forwarded %s->%s rig\n", pn, sn);
+        return 1;
+    }
+    static fo_tap_t tap;
+    memset(&tap, 0, sizeof(tap));
+    g_test_trace_fn = fo_trace_fn;
+    g_test_trace_ctx = &tap;
+    conn_t *pub = rig_connect(&rig, pub_v);
+    conn_t *sub = rig_connect(&rig, sub_v);
+    conn_t *late = rig_connect(&rig, sub_v);
+    g_test_trace_fn = NULL;
+    g_test_trace_ctx = NULL;
+    R_CHECK(&rig, pub && sub && late);
+    if (!pub || !sub || !late) {
+        rig_destroy(&rig);
+        return rig.failures;
+    }
+    rig_pump(&rig, 4);
+    moq_bytes_t nsp[1] = { B("fo") };
+    moq_publish_namespace_cfg_t pcfg;
+    moq_publish_namespace_cfg_init(&pcfg);
+    pcfg.track_namespace = (moq_namespace_t){ .parts = nsp, .count = 1 };
+    moq_announcement_t ann;
+    R_CHECK(&rig, moq_session_publish_namespace(pub->peer, &pcfg, rig.now,
+                                                &ann) == MOQ_OK);
+    rig_pump(&rig, 4);
+    moq_subscribe_cfg_t scfg;
+    moq_subscribe_cfg_init(&scfg);
+    scfg.track_namespace = (moq_namespace_t){ .parts = nsp, .count = 1 };
+    scfg.track_name = B("v");
+    scfg.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
+    scfg.start_group = 0;
+    scfg.start_object = 0;
+    moq_subscription_t sh;
+    R_CHECK(&rig, moq_session_subscribe(sub->peer, &scfg, rig.now, &sh) ==
+                      MOQ_OK);
+    rig_pump(&rig, 6);
+    peer_state_t pub_ps, s_ps, l_ps;
+    memset(&pub_ps, 0, sizeof(pub_ps));
+    memset(&s_ps, 0, sizeof(s_ps));
+    memset(&l_ps, 0, sizeof(l_ps));
+    peer_drain(&rig, pub, &pub_ps, true, false, 0, 0);   /* accept upstream */
+    R_CHECK(&rig, pub_ps.up_seen);
+    rig_pump(&rig, 6);
+
+    moq_subgroup_cfg_t sc;
+    moq_subgroup_cfg_init(&sc);
+    sc.group_id = 0;
+    sc.subgroup_id = 0;
+    sc.publisher_priority = 128;
+    sc.first_object = true;   /* the original publisher opens it from its start */
+    moq_subgroup_handle_t h;
+    DP_RETRY(&rig, moq_session_open_subgroup(pub->peer, pub_ps.up_sub, &sc,
+                                             rig.now, &h));
+    uint8_t body[8];
+    memset(body, 0x5A, sizeof(body));
+    moq_rcbuf_t *pl = NULL;
+    R_CHECK(&rig, moq_rcbuf_create(&a.vt, body, sizeof(body), &pl) == MOQ_OK);
+    DP_RETRY(&rig, moq_session_write_object(pub->peer, h, 0, pl, rig.now));
+    for (int k = 0; k < 60 && s_ps.objects < 1; k++) {
+        rig_pump(&rig, 1);
+        peer_drain(&rig, sub, &s_ps, false, false, 0, 0);
+    }
+    R_CHECK(&rig, s_ps.objects == 1);
+
+    /* The late subscriber: Largest Object = {0, 1}, mid-subgroup. */
+    moq_subscribe_cfg_t lcfg;
+    moq_subscribe_cfg_init(&lcfg);
+    lcfg.track_namespace = (moq_namespace_t){ .parts = nsp, .count = 1 };
+    lcfg.track_name = B("v");
+    lcfg.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+    moq_subscription_t lh;
+    R_CHECK(&rig, moq_session_subscribe(late->peer, &lcfg, rig.now, &lh) ==
+                      MOQ_OK);
+    rig_pump(&rig, 8);
+    peer_drain(&rig, pub, &pub_ps, true, false, 0, 0);
+
+    DP_RETRY(&rig, moq_session_write_object(pub->peer, h, 1, pl, rig.now));
+    moq_rcbuf_decref(pl);
+    DP_RETRY(&rig, moq_session_close_subgroup(pub->peer, h, rig.now));
+    for (int k = 0; k < 60 && (s_ps.objects < 2 || l_ps.objects < 1); k++) {
+        rig_pump(&rig, 1);
+        peer_drain(&rig, sub, &s_ps, false, false, 0, 0);
+        peer_drain(&rig, late, &l_ps, false, false, 0, 0);
+    }
+    R_CHECK(&rig, s_ps.objects == 2);
+    R_CHECK(&rig, l_ps.objects == 1 && l_ps.last_object == 1);
+    R_CHECK(&rig, !s_ps.session_closed && !l_ps.session_closed);
+
+    /* On the wire: publisher -> relay, relay -> subscriber, relay -> late. */
+    uint8_t up = fo_type(&tap, &rig, pub, MOQ_PERSPECTIVE_CLIENT);
+    uint8_t down = fo_type(&tap, &rig, sub, MOQ_PERSPECTIVE_SERVER);
+    uint8_t down_late = fo_type(&tap, &rig, late, MOQ_PERSPECTIVE_SERVER);
+    if (up != (pub_v == MOQ_VERSION_DRAFT_18 ? 0x54 : 0x14) ||
+        down != (both18 ? 0x54 : 0x14) || down_late != 0x14) {
+        printf("FAIL: first_object_forwarded %s->%s: header type upstream "
+               "0x%02x, downstream 0x%02x (expected 0x%02x), late joiner "
+               "0x%02x (expected 0x14)\n", pn, sn, up, down,
+               both18 ? 0x54 : 0x14, down_late);
+        rig.failures++;
+    }
+    /* And to the subscriber's application, on the first object only. */
+    R_CHECK(&rig, s_ps.first_objects == (both18 ? 1 : 0));
+    if (both18) {
+        R_CHECK(&rig, s_ps.first_object_id == 0);   /* object 0, not object 1 */
+    }
+    R_CHECK(&rig, l_ps.first_objects == 0);   /* began mid-subgroup: no bit */
+
+    rig_destroy(&rig);
+    R_CHECK(&rig, a.live == 0);
+    if (rig.failures == 0) {
+        printf("PASS: first_object_forwarded %s->%s\n", pn, sn);
     }
     return rig.failures;
 }
@@ -15497,6 +15693,12 @@ main(int argc, char **argv)
     failures += chunk_liveedge_case(true);    /* abandon → downstream reset */
     failures += chunk_liveedge_evict();       /* eviction-after-stall → reset */
     failures += sub_done_resets_begun_subgroup(); /* SUB_DONE mid-object → reset */
+    /* FIRST_OBJECT forwarded only when the stream starts with the subgroup's
+     * first object, and only draft-18 to draft-18 (section 2.2). */
+    failures += first_object_forwarded(MOQ_VERSION_DRAFT_18, MOQ_VERSION_DRAFT_18);
+    failures += first_object_forwarded(MOQ_VERSION_DRAFT_16, MOQ_VERSION_DRAFT_16);
+    failures += first_object_forwarded(MOQ_VERSION_DRAFT_18, MOQ_VERSION_DRAFT_16);
+    failures += first_object_forwarded(MOQ_VERSION_DRAFT_16, MOQ_VERSION_DRAFT_18);
     /* Retained FETCH over chunked COMPLETE records —
      * parity with whole-object storage across d16/d18 + a backpressure variant. */
     failures += retained_fetch_representation_parity_oracle(MOQ_VERSION_DRAFT_18, 0);

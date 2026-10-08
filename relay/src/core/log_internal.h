@@ -69,6 +69,7 @@ typedef struct moqr_rec {
                                        * written in (NONE otherwise)           */
     bool              datagram_pref;
     bool              end_of_group;
+    bool              first_object;   /* draft-18 FIRST_OBJECT (see log.h) */
 } moqr_rec_t;
 
 typedef struct moqr_rec_vec {

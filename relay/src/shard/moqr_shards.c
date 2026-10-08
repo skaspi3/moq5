@@ -490,6 +490,7 @@ typedef struct r_demand_msg {
     uint8_t      status;
     bool         datagram_pref;
     bool         end_of_group;
+    bool         first_object;   /* draft-18 FIRST_OBJECT, carried like EOG */
     bool         adv_subgroup_end;
     moq_rcbuf_t *payload;
     moq_rcbuf_t *props;
@@ -2502,6 +2503,7 @@ shard_data_phase(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
                     om.declared_len = d.rec.declared_len;
                     om.prio = d.rec.publisher_priority;
                     om.end_of_group = d.rec.end_of_group;
+                    om.first_object = d.rec.first_object;
                     if (d.rec.properties != NULL &&
                         moq_rcbuf_clone(&s->alloc, d.rec.properties,
                                         &om.props) != MOQ_OK) {
@@ -2632,6 +2634,7 @@ shard_data_phase(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
                     em.subgroup_id = d.rec.subgroup_id;
                     em.object_id = d.rec.object_id;
                     em.end_of_group = d.rec.end_of_group;
+                    em.first_object = d.rec.first_object;
                     em.adv_subgroup_end = d.subgroup_end;
                     if (!dch_push_arb(s, shard, src, &em, true,
                                       ctrl_waiting)) {
@@ -2696,6 +2699,7 @@ shard_data_phase(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
             msg.status = (uint8_t)d.rec.status;
             msg.datagram_pref = d.rec.datagram_pref;
             msg.end_of_group = d.rec.end_of_group;
+            msg.first_object = d.rec.first_object;
             msg.adv_subgroup_end = d.subgroup_end;
             bool oom = false;
             if (d.rec.payload != NULL &&
@@ -3007,6 +3011,7 @@ shard_demand_inbound(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
                 desc.status = (moqr_obj_status_t)msg->status;
                 desc.datagram_pref = msg->datagram_pref;
                 desc.end_of_group = msg->end_of_group;
+                desc.first_object = msg->first_object;
                 desc.payload = msg->payload;
                 desc.properties = msg->props;
                 desc.now_us = now_us;
@@ -3088,6 +3093,7 @@ shard_demand_inbound(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
                     desc.object_id = msg->object_id;
                     desc.publisher_priority = msg->prio;
                     desc.end_of_group = msg->end_of_group;
+                    desc.first_object = msg->first_object;
                     desc.obj_state = MOQR_OBJ_OPEN;
                     desc.declared_len = msg->declared_len;
                     desc.properties = msg->props;

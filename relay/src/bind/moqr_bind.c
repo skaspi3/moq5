@@ -3079,6 +3079,7 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
         d.status = (moqr_obj_status_t)ob->status;
         d.datagram_pref = ob->datagram;
         d.end_of_group = ob->end_of_group;
+        d.first_object = ob->first_object;
         d.payload = ob->payload;        /* ownership transfers on OK */
         d.properties = ob->properties;
         d.now_us = now_us;
@@ -3118,6 +3119,7 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
             d.publisher_priority = oc->publisher_priority;
             d.status = (moqr_obj_status_t)oc->status;
             d.end_of_group = oc->end_of_group;
+            d.first_object = oc->first_object;
             d.payload = NULL;
             d.properties = oc->properties;   /* ownership transfers on OK */
             d.now_us = now_us;
@@ -3142,6 +3144,7 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
             d.publisher_priority = oc->publisher_priority;
             d.status = MOQR_OBJ_NORMAL;
             d.end_of_group = oc->end_of_group;
+            d.first_object = oc->first_object;
             d.obj_state = MOQR_OBJ_OPEN;
             d.declared_len = oc->payload_length;
             d.properties = oc->properties;   /* ownership transfers on OK */
@@ -5446,6 +5449,14 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
                      * record of the upstream subgroup, so the first record
                      * (which opens the downstream stream) preserves the bit. */
                     sc.end_of_group = d.rec.end_of_group;
+                    /* draft-18 section 2.2: "A relay forwarding a subgroup
+                     * that begins with the first object ever published in
+                     * that subgroup MUST set the FIRST_OBJECT bit." This
+                     * record opens the downstream stream, so the stream
+                     * begins with it: set the bit exactly when the record
+                     * arrived as that first object. A draft-16 upstream
+                     * cannot say so, and a draft-16 downstream has no bit. */
+                    sc.first_object = d.rec.first_object;
                     moq_subgroup_handle_t h;
                     if (freei < 0) {
                         /* Bind subgroup slots exhausted — never reaches the

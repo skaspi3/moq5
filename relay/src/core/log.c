@@ -927,6 +927,7 @@ moqr_log_append(moqr_log_t *log, const moqr_log_append_desc_t *desc)
     rec.obj_state = desc->obj_state;   /* COMPLETE (0) or OPEN */
     rec.datagram_pref = desc->datagram_pref;
     rec.end_of_group = desc->end_of_group;
+    rec.first_object = desc->first_object;
 
     uint32_t rec_index = 0;
     moqr_rec_vec_t *dst = desc->datagram_pref ? &g->dg : &sg->v;
@@ -1341,6 +1342,7 @@ view_fill(moqr_record_view_t *out, const moqr_rec_t *rec)
     out->obj_state = rec->obj_state;
     out->datagram_pref = rec->datagram_pref;
     out->end_of_group = rec->end_of_group;
+    out->first_object = rec->first_object;
     out->payload = rec->payload;
     out->properties = rec->properties;
     out->chunk_count = rec->chunk_count;

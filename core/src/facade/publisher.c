@@ -225,6 +225,12 @@ struct moq_pub_track {
      * mandatory, so add_track fails (MOQ_ERR_NOMEM) rather than linking a
      * track without a reservation. */
     moq_track_hist_t   *hist;
+
+    /* Draft-18 FIRST_OBJECT: the lowest object id published in the newest
+     * group, live or retained (track_note_object). */
+    bool                first_obj_valid;
+    uint64_t            first_obj_group;
+    uint64_t            first_obj_id;
 };
 
 typedef struct {
@@ -1831,6 +1837,36 @@ moq_result_t moq_pub_remove_track(moq_publisher_t *pub,
 
 /* -- Retained group (origin-local Joining-FETCH cache) -------------- */
 
+/* draft-ietf-moq-transport-18 section 2.2: "When the Original Publisher opens
+ * a new subgroup, it MUST set the FIRST_OBJECT bit (Section 11.4.2) to
+ * indicate that the first object in the subgroup stream is the first object
+ * ever published in that subgroup." The facade publishes a group's stream
+ * objects in subgroup 0, so it keeps the lowest object id published in the
+ * track's newest group, written live or installed as the retained group (a
+ * catalog may be installed retained first and then written live: the same
+ * object). A subgroup stream that opens with exactly that object sets the
+ * bit; one that joins mid-subgroup does not. An older group arriving late on
+ * a non-monotonic track is not tracked, so it gets no bit. Datagrams have no
+ * subgroup and are not noted. */
+static void track_note_object(moq_pub_track_t *t, uint64_t group_id,
+                              uint64_t object_id)
+{
+    if (!t->first_obj_valid || group_id > t->first_obj_group) {
+        t->first_obj_valid = true;
+        t->first_obj_group = group_id;
+        t->first_obj_id = object_id;
+    } else if (group_id == t->first_obj_group && object_id < t->first_obj_id) {
+        t->first_obj_id = object_id;
+    }
+}
+
+static bool track_is_first_object(const moq_pub_track_t *t, uint64_t group_id,
+                                  uint64_t object_id)
+{
+    return t->first_obj_valid && group_id == t->first_obj_group &&
+           object_id == t->first_obj_id;
+}
+
 /* Install a retained group from `src` (object_id strictly ascending; src[0] is
  * the independent base). Validates bounds/order/byte-budget, deep-copies
  * (incref), replaces the prior retained set, and resets wrote_object -- the
@@ -1860,6 +1896,7 @@ static moq_result_t track_install_retained(moq_pub_track_t *t, uint64_t group_id
     t->retained_count = n;
     t->retained_group_id = group_id;
     t->has_retained = true;
+    track_note_object(t, group_id, src[0].object_id);
     t->wrote_object = false;   /* retained group is now the latest published loc */
     if (retained_can_advertise_largest(t))
         track_hist_merge(t->hist, group_id,
@@ -1973,6 +2010,8 @@ static moq_result_t write_stream_object(moq_publisher_t *pub,
         sgcfg.publisher_priority = track->priority;
         sgcfg.object_properties = need_ext;
         sgcfg.end_of_group = want_eog;
+        sgcfg.first_object = track_is_first_object(track, obj->group_id,
+                                                   obj->object_id);
 
         moq_result_t rc = (slot->kind == PUB_SLOT_PUBLICATION)
             ? moq_session_open_pub_subgroup(pub->session,
@@ -2138,6 +2177,8 @@ moq_result_t moq_pub_write_object_ex(moq_publisher_t *pub,
             obj->group_id, obj->object_id, obj->datagram, obj->has_status,
             obj->has_status ? obj->status : MOQ_OBJECT_NORMAL,
             want_eog, 0, obj->payload, obj->properties);
+        if (!obj->datagram)
+            track_note_object(track, obj->group_id, obj->object_id);
         track_hist_merge(track->hist, obj->group_id, obj->object_id);
         MOQ_PUB_TEST_BUMP(moq_pub_test_merge_count);
         if (track->monotonic) {
@@ -2398,6 +2439,9 @@ moq_result_t moq_pub_end_track(moq_publisher_t *pub, moq_pub_track_t *track,
         sgcfg.subgroup_id = 0;
         sgcfg.publisher_priority = track->priority;
         sgcfg.object_properties = false;
+        /* {term_g, 0} is above every published group: the END_OF_TRACK is
+         * the first object ever published in this subgroup. */
+        sgcfg.first_object = true;
         moq_subgroup_handle_t sg;
         moq_result_t rc = moq_session_open_subgroup(pub->session, slot->sub,
             &sgcfg, now_us, &sg);
@@ -2566,6 +2610,7 @@ static moq_result_t begin_object_impl(moq_publisher_t *pub,
         track_op_commit(track, PUB_OP_BEGIN_OBJECT,
             cfg->group_id, cfg->object_id, false, false, MOQ_OBJECT_NORMAL,
             false, cfg->payload_length, NULL, begin_props);
+        track_note_object(track, cfg->group_id, cfg->object_id);
         track_hist_merge(track->hist, cfg->group_id, cfg->object_id);
         MOQ_PUB_TEST_BUMP(moq_pub_test_merge_count);
         if (track->monotonic &&
@@ -2603,6 +2648,8 @@ static moq_result_t begin_object_impl(moq_publisher_t *pub,
             sgcfg.subgroup_id = 0;
             sgcfg.publisher_priority = track->priority;
             sgcfg.object_properties = need_ext;
+            sgcfg.first_object = track_is_first_object(track, cfg->group_id,
+                                                       cfg->object_id);
             moq_result_t rc = (slot->kind == PUB_SLOT_PUBLICATION)
                 ? moq_session_open_pub_subgroup(pub->session,
                     slot->pub, &sgcfg, now_us, &slot->sg)

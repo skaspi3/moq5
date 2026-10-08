@@ -2748,6 +2748,7 @@ static moq_result_t d18_decode_subgroup_header_op(
     out->publisher_priority = hdr.default_priority ? 128 : hdr.publisher_priority;
     out->has_extensions = hdr.has_properties;
     out->end_of_group = hdr.end_of_group;
+    out->first_object = hdr.first_object;
     switch (hdr.subgroup_id_mode) {
     case MOQ_SUBGROUP_ID_MODE_ZERO:
         out->subgroup_id = 0;
@@ -2779,7 +2780,10 @@ static moq_result_t d18_encode_subgroup_header_op(
     hdr.subgroup_id_mode = MOQ_SUBGROUP_ID_MODE_PRESENT;
     hdr.end_of_group = args->end_of_group;
     hdr.default_priority = false;
-    hdr.first_object = false;
+    /* Section 2.2: the original publisher MUST set it on a subgroup it opens
+     * from the start, and a relay forwarding a subgroup from the first object
+     * ever published in it MUST set it. The caller knows which. */
+    hdr.first_object = args->first_object;
     hdr.track_alias = args->track_alias;
     hdr.group_id = args->group_id;
     hdr.subgroup_id = args->subgroup_id;

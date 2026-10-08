@@ -1192,6 +1192,7 @@ typedef struct moq_decoded_subgroup_header {
     bool     end_of_group;
     bool     subgroup_id_resolved;
     bool     subgroup_id_from_first_object;
+    bool     first_object;   /* draft-18 FIRST_OBJECT bit; false in draft-16 */
 } moq_decoded_subgroup_header_t;
 
 typedef struct moq_decoded_object_header {
@@ -1212,6 +1213,7 @@ typedef struct moq_subgroup_header_encode_args {
     uint8_t  publisher_priority;
     bool     has_extensions;
     bool     end_of_group;
+    bool     first_object;   /* draft-18 FIRST_OBJECT; no wire form in draft-16 */
 } moq_subgroup_header_encode_args_t;
 
 typedef struct moq_object_header_encode_args {
@@ -1351,6 +1353,9 @@ typedef struct moq_rx_stream {
     bool                   subgroup_id_from_first_object;
     bool                   subgroup_id_resolved;
     bool                   end_of_group;
+    bool                   first_object_hdr;  /* header had draft-18 FIRST_OBJECT */
+    bool                   cur_first_object;  /* the current object is the
+                                                 stream's first under that bit */
     uint64_t               prev_object_id;
 
     uint8_t                hdr_buf[MOQ_RX_HDR_BUF];

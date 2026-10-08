@@ -510,6 +510,7 @@ static moq_result_t rx_push_pending_chunk(moq_session_t *s, int slot)
         e.u.object_chunk.publisher_priority = rx->publisher_priority;
         e.u.object_chunk.status = rx->cur_status;
         e.u.object_chunk.end_of_group = rx->end_of_group;
+        e.u.object_chunk.first_object = rx->cur_first_object;
         e.u.object_chunk.payload_length = rx->payload_expected;
         e.u.object_chunk.properties = rx->cur_extensions;
     }
@@ -687,6 +688,7 @@ static moq_result_t rx_emit_object(moq_session_t *s, int slot)
     e.u.object_received.publisher_priority = rx->publisher_priority;
     e.u.object_received.status = rx->cur_status;
     e.u.object_received.end_of_group = rx->end_of_group;
+    e.u.object_received.first_object = rx->cur_first_object;
     e.u.object_received.payload = payload;
     e.u.object_received.properties = rx->cur_extensions;
 
@@ -1261,6 +1263,7 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
                     rx->publisher_priority = hdr.publisher_priority;
                     rx->has_extensions = hdr.has_extensions;
                     rx->end_of_group = hdr.end_of_group;
+                    rx->first_object_hdr = hdr.first_object;
                     rx->subgroup_id_from_first_object =
                         hdr.subgroup_id_from_first_object;
                     rx->subgroup_id = hdr.subgroup_id;
@@ -1288,6 +1291,7 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
             rx->publisher_priority = hdr.publisher_priority;
             rx->has_extensions = hdr.has_extensions;
             rx->end_of_group = hdr.end_of_group;
+            rx->first_object_hdr = hdr.first_object;
             rx->subgroup_id_from_first_object = hdr.subgroup_id_from_first_object;
             rx->subgroup_id = hdr.subgroup_id;
             rx->subgroup_id_resolved = hdr.subgroup_id_resolved;
@@ -1522,6 +1526,8 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
 
             rx->cur_object_id = object_id;
             rx->cur_status = semantic;
+            /* FIRST_OBJECT describes the stream's first object only. */
+            rx->cur_first_object = rx->first_object_hdr && !rx->has_prev_object;
             rx->prev_object_id = object_id;
             rx->has_prev_object = true;
             rx->payload_expected = payload_len;

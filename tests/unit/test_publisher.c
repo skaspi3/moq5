@@ -597,6 +597,265 @@ static void test_write_single_sub(void) {
     MOQ_TEST_PASS("write_single_sub");
 }
 
+/* draft-ietf-moq-transport-18 section 2.2: "When the Original Publisher opens a
+ * new subgroup, it MUST set the FIRST_OBJECT bit (Section 11.4.2) to indicate
+ * that the first object in the subgroup stream is the first object ever
+ * published in that subgroup." The SimPair trace shows each SUBGROUP_HEADER the
+ * publisher writes (the first SEND_DATA on a stream) and the first object id on
+ * that stream (the next one). Every track uses its own groups:
+ *   a  groups 0 and 1 written from their start, group 3 streamed
+ *      (begin_object), then END_OF_TRACK in group 4: 0x54 (FIRST_OBJECT) on
+ *      every stream;
+ *   b  a Largest Object joiner whose stream starts at (2,1): 0x14, no bit;
+ *   c  the group installed retained first, then written live: 0x54;
+ *   p  sent on a PUBLISH instead of a SUBSCRIBE: as track a.
+ * Draft-16 has no such bit: 0x14 everywhere. */
+typedef struct fo_stream {
+    uint64_t ref;
+    uint64_t type, group, first_obj;
+    bool     has_first;
+} fo_stream_t;
+
+typedef struct fo_tap {
+    moq_version_t ver;
+    fo_stream_t   s[16];
+    size_t        n;
+    bool          overflow, bad;
+} fo_tap_t;
+
+static void fo_trace(void *ctx, const moq_sim_trace_record_t *r)
+{
+    fo_tap_t *t = (fo_tap_t *)ctx;
+    if (r->kind != MOQ_SIM_TRACE_ACTION ||
+        r->action_kind != MOQ_ACTION_SEND_DATA ||
+        r->from != MOQ_PERSPECTIVE_SERVER || r->bytes.len == 0)
+        return;
+    if (r->struct_size < offsetof(moq_sim_trace_record_t, stream_ref) +
+                         sizeof(r->stream_ref)) {
+        t->bad = true;
+        return;
+    }
+    const bool d18 = t->ver == MOQ_VERSION_DRAFT_18;
+    moq_buf_reader_t rd;
+    moq_buf_reader_init(&rd, r->bytes.data, r->bytes.len);
+    fo_stream_t *st = NULL;
+    for (size_t i = 0; i < t->n; i++)
+        if (t->s[i].ref == r->stream_ref._v) st = &t->s[i];
+    if (!st) {   /* a new stream: its SUBGROUP_HEADER */
+        if (t->n == sizeof(t->s) / sizeof(t->s[0])) {
+            t->overflow = true;
+            return;
+        }
+        st = &t->s[t->n++];
+        memset(st, 0, sizeof(*st));
+        st->ref = r->stream_ref._v;
+        if (d18) {
+            moq_d18_subgroup_header_t h;
+            if (moq_d18_decode_subgroup_header(&rd, &h) != MOQ_OK) {
+                t->bad = true;
+                return;
+            }
+            st->type = h.type;
+            st->group = h.group_id;
+        } else {
+            moq_d16_subgroup_header_t h;
+            if (moq_d16_decode_subgroup_header(&rd, &h) != MOQ_OK) {
+                t->bad = true;
+                return;
+            }
+            st->type = h.type;
+            st->group = h.group_id;
+        }
+        if (moq_buf_reader_remaining(&rd) == 0) return;
+    }
+    if (!st->has_first) {   /* the stream's first object: delta == its id */
+        moq_result_t rc = d18 ? moq_buf_read_vi64(&rd, &st->first_obj)
+                              : moq_buf_read_varint(&rd, &st->first_obj);
+        if (rc != MOQ_OK) {
+            t->bad = true;
+            return;
+        }
+        st->has_first = true;
+    }
+}
+
+/* The header type of the stream that carried group g from object o first. */
+static uint64_t fo_type(const fo_tap_t *t, uint64_t g, uint64_t o)
+{
+    for (size_t i = 0; i < t->n; i++)
+        if (t->s[i].group == g && t->s[i].has_first && t->s[i].first_obj == o)
+            return t->s[i].type;
+    return 0;   /* no such stream */
+}
+
+static void fo_pump(moq_simpair_t *sp, moq_publisher_t *pub)
+{
+    for (int k = 0; k < 6; k++) {
+        moq_simpair_run_until_quiescent(sp, 16, NULL);
+        moq_event_t ev;
+        while (moq_session_poll_events(moq_simpair_server(sp), &ev, 1) == 1) {
+            moq_pub_event_result_t res;
+            moq_pub_handle_event(pub, &ev, moq_simpair_now_us(sp), &res);
+            moq_event_cleanup(&ev);
+        }
+        while (moq_session_poll_events(moq_simpair_client(sp), &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_PUBLISH_REQUEST) {
+                moq_accept_publish_cfg_t acc;
+                moq_accept_publish_cfg_init(&acc);
+                moq_session_accept_publish(moq_simpair_client(sp),
+                    ev.u.publish_request.pub, &acc, moq_simpair_now_us(sp));
+            }
+            moq_event_cleanup(&ev);
+        }
+    }
+}
+
+static void fo_subscribe(moq_simpair_t *sp, moq_bytes_t *ns, const char *name,
+                         uint8_t filter)
+{
+    moq_subscribe_cfg_t scfg;
+    moq_subscribe_cfg_init(&scfg);
+    scfg.track_namespace.parts = ns;
+    scfg.track_namespace.count = 1;
+    scfg.track_name = (moq_bytes_t){ (const uint8_t *)name, strlen(name) };
+    scfg.filter = filter;
+    scfg.start_group = 0;
+    scfg.start_object = 0;
+    moq_subscription_t h;
+    MOQ_TEST_CHECK(moq_session_subscribe(moq_simpair_client(sp), &scfg,
+                                         moq_simpair_now_us(sp), &h) == MOQ_OK);
+}
+
+static void test_first_object_bit(moq_version_t ver)
+{
+    const bool d18 = ver == MOQ_VERSION_DRAFT_18;
+    const uint64_t with_bit = d18 ? 0x54 : 0x14;   /* FIRST_OBJECT = 0x40 */
+    test_alloc_state_t as = {0};
+    moq_alloc_t alloc = test_allocator(&as);
+    fo_tap_t tap;
+    memset(&tap, 0, sizeof(tap));
+    tap.ver = ver;
+    moq_simpair_cfg_t pcfg = MOQ_SIMPAIR_CFG_INIT;
+    pcfg.alloc = &alloc;
+    pcfg.seed = 42;
+    pcfg.initial_now_us = 1000;
+    pcfg.version = ver;
+    pcfg.client_send_request_capacity = true;
+    pcfg.client_initial_request_capacity = 16;
+    pcfg.server_send_request_capacity = true;
+    pcfg.server_initial_request_capacity = 16;
+    pcfg.trace_fn = fo_trace;
+    pcfg.trace_ctx = &tap;
+    moq_simpair_t *sp = NULL;
+    MOQ_TEST_CHECK(moq_simpair_create(&pcfg, &sp) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_simpair_start(sp) == MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    drain_all(sp);
+
+    moq_pub_cfg_t cfg;
+    moq_pub_cfg_init_sized(&cfg, sizeof(cfg));
+    cfg.accept_mode = MOQ_PUB_ACCEPT_ALL;
+    moq_publisher_t *pub = NULL;
+    MOQ_TEST_CHECK(moq_pub_create(moq_simpair_server(sp), &alloc, &cfg, &pub) ==
+                   MOQ_OK);
+    moq_bytes_t ns[] = { MOQ_BYTES_LITERAL("fo") };
+    const char *names[4] = { "a", "b", "c", "p" };
+    moq_pub_track_t *tr[4] = { NULL, NULL, NULL, NULL };
+    for (int i = 0; i < 4; i++) {
+        moq_pub_track_cfg_t tcfg;
+        moq_pub_track_cfg_init(&tcfg);
+        tcfg.track_namespace.parts = ns;
+        tcfg.track_namespace.count = 1;
+        tcfg.track_name = (moq_bytes_t){ (const uint8_t *)names[i], 1 };
+        MOQ_TEST_CHECK(moq_pub_add_track(pub, &tcfg, moq_simpair_now_us(sp),
+                                         &tr[i]) == MOQ_OK);
+    }
+    uint8_t data[4] = { 1, 2, 3, 4 };
+    moq_rcbuf_t *pl = NULL;
+    MOQ_TEST_CHECK(moq_rcbuf_create(&alloc, data, sizeof(data), &pl) == MOQ_OK);
+
+    fo_subscribe(sp, ns, "a", MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START);
+    fo_subscribe(sp, ns, "c", MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START);
+    moq_pub_publish_cfg_t pubc;
+    moq_pub_publish_cfg_init(&pubc);
+    MOQ_TEST_CHECK(moq_pub_publish_track(pub, tr[3], &pubc,
+                                         moq_simpair_now_us(sp)) == MOQ_OK);
+    fo_pump(sp, pub);
+    MOQ_TEST_CHECK(moq_pub_track_is_published(pub, tr[3]));
+
+    /* a: (0,0) (0,1), then (1,0) on a new stream. */
+    MOQ_TEST_CHECK(moq_pub_write_object(pub, tr[0], 0, 0, pl,
+                                        moq_simpair_now_us(sp)) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_pub_write_object(pub, tr[0], 0, 1, pl,
+                                        moq_simpair_now_us(sp)) == MOQ_OK);
+    fo_pump(sp, pub);
+    MOQ_TEST_CHECK(moq_pub_write_object(pub, tr[0], 1, 0, pl,
+                                        moq_simpair_now_us(sp)) == MOQ_OK);
+    /* a: (3,0) streamed. */
+    moq_pub_begin_object_cfg_t bcfg;
+    moq_pub_begin_object_cfg_init_sized(&bcfg, sizeof(bcfg));
+    bcfg.group_id = 3;
+    bcfg.object_id = 0;
+    bcfg.payload_length = sizeof(data);
+    MOQ_TEST_CHECK(moq_pub_begin_object(pub, tr[0], &bcfg,
+                                        moq_simpair_now_us(sp)) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_pub_write_data(pub, tr[0], pl,
+                                      moq_simpair_now_us(sp)) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_pub_end_object(pub, tr[0],
+                                      moq_simpair_now_us(sp)) == MOQ_OK);
+    fo_pump(sp, pub);
+    /* a: END_OF_TRACK at (4,0). */
+    MOQ_TEST_CHECK(moq_pub_end_track(pub, tr[0],
+                                     moq_simpair_now_us(sp)) == MOQ_OK);
+    /* p: as a, over the PUBLISH. */
+    MOQ_TEST_CHECK(moq_pub_write_object(pub, tr[3], 7, 0, pl,
+                                        moq_simpair_now_us(sp)) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_pub_write_object(pub, tr[3], 7, 1, pl,
+                                        moq_simpair_now_us(sp)) == MOQ_OK);
+    fo_pump(sp, pub);
+    MOQ_TEST_CHECK(moq_pub_write_object(pub, tr[3], 8, 0, pl,
+                                        moq_simpair_now_us(sp)) == MOQ_OK);
+    /* b: (2,0) with nobody subscribed yet, then a Largest Object joiner. */
+    MOQ_TEST_CHECK(moq_pub_write_object(pub, tr[1], 2, 0, pl,
+                                        moq_simpair_now_us(sp)) == MOQ_OK);
+    fo_pump(sp, pub);
+    fo_subscribe(sp, ns, "b", MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT);
+    fo_pump(sp, pub);
+    MOQ_TEST_CHECK(moq_pub_write_object(pub, tr[1], 2, 1, pl,
+                                        moq_simpair_now_us(sp)) == MOQ_OK);
+    /* c: retained first (a catalog's order), then the same object live. */
+    moq_pub_retained_object_t robj = { .object_id = 0, .payload = pl };
+    moq_pub_retained_group_cfg_t rg;
+    moq_pub_retained_group_cfg_init(&rg);
+    rg.group_id = 5;
+    rg.objects = &robj;
+    rg.object_count = 1;
+    MOQ_TEST_CHECK(moq_pub_set_retained_group(pub, tr[2], &rg) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_pub_write_object(pub, tr[2], 5, 0, pl,
+                                        moq_simpair_now_us(sp)) == MOQ_OK);
+    fo_pump(sp, pub);
+    moq_rcbuf_decref(pl);
+
+    MOQ_TEST_CHECK(!tap.bad && !tap.overflow);
+    MOQ_TEST_CHECK_EQ_SIZE(tap.n, 8);   /* a: 4, p: 2, b: 1, c: 1 */
+    MOQ_TEST_CHECK_EQ_HEX(fo_type(&tap, 0, 0), with_bit);   /* a */
+    MOQ_TEST_CHECK_EQ_HEX(fo_type(&tap, 1, 0), with_bit);
+    MOQ_TEST_CHECK_EQ_HEX(fo_type(&tap, 3, 0), with_bit);   /* streamed */
+    MOQ_TEST_CHECK_EQ_HEX(fo_type(&tap, 4, 0), with_bit);   /* END_OF_TRACK */
+    MOQ_TEST_CHECK_EQ_HEX(fo_type(&tap, 7, 0), with_bit);   /* p */
+    MOQ_TEST_CHECK_EQ_HEX(fo_type(&tap, 8, 0), with_bit);
+    MOQ_TEST_CHECK_EQ_HEX(fo_type(&tap, 2, 1), 0x14);       /* b: joined late */
+    MOQ_TEST_CHECK_EQ_HEX(fo_type(&tap, 5, 0), with_bit);   /* c */
+
+    for (int i = 0; i < 4; i++)
+        moq_pub_remove_track(pub, tr[i], moq_simpair_now_us(sp));
+    moq_pub_destroy(pub);
+    drain_all(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS(d18 ? "first_object_bit d18" : "first_object_bit d16");
+}
+
 /* moq_pub_end_track: reliable terminal + the now-defined write-after-end
  * contract (WRONG_STATE, not undefined) + idempotency, end to end over the
  * SimPair wire. */
@@ -14796,6 +15055,8 @@ int main(void) {
     test_subscribe_no_match();
     test_subscribe_duplicate_rejected();
     test_write_single_sub();
+    test_first_object_bit(MOQ_VERSION_DRAFT_18);   /* section 2.2 */
+    test_first_object_bit(MOQ_VERSION_DRAFT_16);
     test_end_track();
     test_finish_subscribers();
     test_finish_subscribers_skips_publication();

@@ -259,6 +259,11 @@ moq_result_t moq_session_open_subgroup(
         sizeof(cfg->end_of_group))
         eog = cfg->end_of_group;
 
+    bool first = false;
+    if (cfg->struct_size >= offsetof(moq_subgroup_cfg_t, first_object) +
+        sizeof(cfg->first_object))
+        first = cfg->first_object;
+
     moq_subgroup_header_encode_args_t hdr_args = {
         .track_alias = s->subs[sub_slot].track_alias,
         .group_id = cfg->group_id,
@@ -266,6 +271,7 @@ moq_result_t moq_session_open_subgroup(
         .publisher_priority = cfg->publisher_priority,
         .has_extensions = has_ext,
         .end_of_group = eog,
+        .first_object = first,
     };
 
     moq_action_t a;

@@ -4159,6 +4159,7 @@ static moq_result_t d16_decode_subgroup_header_op(moq_session_t *s,
     out->publisher_priority = hdr.default_priority ? 128 : hdr.publisher_priority;
     out->has_extensions = hdr.has_extensions;
     out->end_of_group = hdr.end_of_group;
+    out->first_object = false;   /* no FIRST_OBJECT bit before draft-18 */
     switch (hdr.subgroup_id_mode) {
     case MOQ_SUBGROUP_ID_MODE_ZERO:
         out->subgroup_id = 0;

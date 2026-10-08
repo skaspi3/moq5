@@ -1713,6 +1713,9 @@ resolved(moqr_shards_t *s, uint16_t i, uint64_t *code, bool *pre)
     return moqr_shards_debug_remote_demand_resolved(s, i, code, pre);
 }
 
+/* The draft-18 FIRST_OBJECT bit pub_obj / pub_open_rec put on the record. */
+static bool g_pub_first_object;
+
 /* Ingest one object (optionally with properties, a status shape, or the
  * datagram preference) into an owned track on shard i. Payload bytes are a
  * fill pattern so identity survives the boundary crossing verifiably. */
@@ -1730,6 +1733,7 @@ pub_obj(moqr_shards_t *s, ca_t *a, uint16_t i, moqr_track_t th, uint64_t g,
     d.status = (moqr_obj_status_t)status;
     d.datagram_pref = datagram;
     d.end_of_group = eog;
+    d.first_object = g_pub_first_object;
     d.now_us = 1;
     if (len != 0) {
         uint8_t buf[256];
@@ -1777,6 +1781,7 @@ typedef struct dl_probe {
     uint8_t  status;
     bool     datagram;
     bool     eog;
+    bool     first_object;
     size_t   len, prop_len;
     uint8_t  first, prop_first;
     uint8_t  notice;
@@ -1801,6 +1806,7 @@ pull_one(moqr_shards_t *s, uint16_t i, moqr_binding_t b, dl_probe_t *out)
     out->status = (uint8_t)d.rec.status;
     out->datagram = d.rec.datagram_pref;
     out->eog = d.rec.end_of_group;
+    out->first_object = d.rec.first_object;
     out->notice = d.notice;
     out->sg_end = d.subgroup_end;
     out->reset = d.rec.reset;
@@ -2494,8 +2500,10 @@ test_shards_data_obj_delivery(void)
     moqr_sub_t sub;
     MOQ_TEST_CHECK(do_subscribe(s, 1, d1, "dtA", 7, &sub) == MOQR_OK);
     step_n(s, 4);   /* ACKED: the pump-sub rides the live edge */
+    g_pub_first_object = true;
     MOQ_TEST_CHECK(pub_obj(s, &a, 0, ot, 0, 3, 0, 0xA7, 24, 0xB1, 8, 0, false,
                            true) == MOQR_OK);
+    g_pub_first_object = false;
     step_n(s, 4);   /* extract + cross + apply */
 
     moqr_core_stats_t st;
@@ -2508,6 +2516,7 @@ test_shards_data_obj_delivery(void)
     MOQ_TEST_CHECK_EQ_U64(pr.object, 0);
     MOQ_TEST_CHECK_EQ_U64(pr.prio, 77);
     MOQ_TEST_CHECK(pr.eog);
+    MOQ_TEST_CHECK(pr.first_object);   /* draft-18 FIRST_OBJECT crossed too */
     MOQ_TEST_CHECK_EQ_U64(pr.len, 24);
     MOQ_TEST_CHECK_EQ_U64(pr.first, 0xA7);
     MOQ_TEST_CHECK_EQ_U64(pr.prop_len, 8);
@@ -2519,6 +2528,7 @@ test_shards_data_obj_delivery(void)
     step_n(s, 4);
     MOQ_TEST_CHECK(pull_one(s, 1, d1, &pr) == MOQR_OK);
     MOQ_TEST_CHECK(pr.datagram);
+    MOQ_TEST_CHECK(!pr.first_object);
     MOQ_TEST_CHECK_EQ_U64(pr.first, 0xC2);
     uint64_t turns = 0, msgs = 0, bytes = 0;
     moqr_shards_debug_pump_counters(s, 0, &turns, &msgs, &bytes);
@@ -3378,6 +3388,7 @@ pub_open_rec(moqr_shards_t *s, ca_t *a, uint16_t i, moqr_track_t th,
     d.object_id = o;
     d.publisher_priority = 77;
     d.end_of_group = eog;
+    d.first_object = g_pub_first_object;
     d.obj_state = MOQR_OBJ_OPEN;
     d.declared_len = declared;
     d.now_us = 1;
@@ -4457,14 +4468,17 @@ test_shards_chunk_eog_header(void)
     moqr_sub_t sub;
     MOQ_TEST_CHECK(do_subscribe(s, 1, d1, "ckE", 7, &sub) == MOQR_OK);
     step_n(s, 4);
+    g_pub_first_object = true;
     MOQ_TEST_CHECK(pub_open_rec(s, &a, 0, ot, 0, 0, 0, 16, true, 0, 0) ==
                    MOQR_OK);
+    g_pub_first_object = false;
     MOQ_TEST_CHECK(pub_chunk(s, &a, 0, ot, 0, 0, 0, 0x44, 16) == MOQR_OK);
     MOQ_TEST_CHECK(pub_complete(s, 0, ot, 0, 0, 0) == MOQR_OK);
     step_n(s, 6);
     dl_probe_t pr;
     MOQ_TEST_CHECK(pull_one(s, 1, d1, &pr) == MOQR_OK);
     MOQ_TEST_CHECK(pr.eog);   /* the header bit crossed on OBJ_OPEN */
+    MOQ_TEST_CHECK(pr.first_object);   /* and FIRST_OBJECT with it */
     /* No premature seal: object 1 in the same subgroup follows through. */
     MOQ_TEST_CHECK(pub_open_rec(s, &a, 0, ot, 0, 0, 1, 16, false, 0, 0) ==
                    MOQR_OK);
@@ -4473,6 +4487,7 @@ test_shards_chunk_eog_header(void)
     step_n(s, 6);
     MOQ_TEST_CHECK(pull_one(s, 1, d1, &pr) == MOQR_OK);
     MOQ_TEST_CHECK_EQ_U64(pr.object, 1);
+    MOQ_TEST_CHECK(!pr.first_object);
     MOQ_TEST_CHECK_EQ_U64(pr.first, 0x45);
     MOQ_TEST_CHECK_EQ_U64(dch_total(s, 2), 0);
     moqr_shards_destroy(s);

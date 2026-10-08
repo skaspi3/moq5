@@ -1015,7 +1015,12 @@ typedef struct moq_object_received_event {
     moq_object_status_t status;
     bool               end_of_group;  /* subgroup header END_OF_GROUP bit */
     bool               datagram;      /* true if delivered via datagram */
-    uint8_t            _pad[4];
+    bool               first_object;  /* draft-18 FIRST_OBJECT: the stream's
+                                       * header had the bit and this is the
+                                       * stream's first object, i.e. the first
+                                       * object ever published in its subgroup.
+                                       * Always false under draft-16. */
+    uint8_t            _pad[3];
     moq_rcbuf_t       *payload;     /* OWNED ref transferred on poll; NULL for status objects */
     moq_rcbuf_t       *properties;  /* OWNED ref transferred on poll; NULL if none */
 } moq_object_received_event_t;
@@ -1264,7 +1269,9 @@ typedef struct moq_object_chunk_event {
     uint8_t               publisher_priority; /* valid when begin=true */
     moq_object_status_t   status;          /* valid when begin=true */
     bool                  end_of_group;    /* valid when begin=true */
-    uint8_t               _pad2[4];
+    bool                  first_object;    /* valid when begin=true; as in
+                                              moq_object_received_event_t */
+    uint8_t               _pad2[3];
     uint64_t              payload_length;  /* declared wire length; valid when begin=true */
     moq_rcbuf_t          *properties;      /* OWNED; valid when begin=true, NULL if none */
     /* Appended. The peer's RESET_STREAM application code, valid ONLY on a
@@ -2900,6 +2907,13 @@ typedef struct moq_subgroup_cfg {
     bool     object_properties;
     uint8_t  _reserved_sg2[7];
     bool     end_of_group;
+    uint8_t  _reserved_sg3[7];
+    /* Appended. Draft-18 SUBGROUP_HEADER FIRST_OBJECT bit (section 2.2): set it
+     * when the first object written on this stream is the first object ever
+     * published in the subgroup -- the original publisher opening a subgroup
+     * from its start, or a relay forwarding one from its first object. Ignored
+     * under draft-16, which has no such bit. */
+    bool     first_object;
 } moq_subgroup_cfg_t;
 
 MOQ_API void moq_subgroup_cfg_init(moq_subgroup_cfg_t *cfg);

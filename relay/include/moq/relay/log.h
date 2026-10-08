@@ -144,6 +144,9 @@ typedef struct moqr_log_append_desc {
     bool              datagram_pref; /* preference Datagram: no subgroup    */
     bool              end_of_group;  /* EOG evidence on this record (bit or
                                       * status; see spec anchors above)     */
+    bool              first_object;  /* the first object ever published in
+                                      * its subgroup (draft-18 FIRST_OBJECT
+                                      * on the stream that carried it)      */
     moq_rcbuf_t      *payload;       /* ownership TRANSFERS on success;
                                       * NULL for status-only objects        */
     moq_rcbuf_t      *properties;    /* ownership TRANSFERS on success;
@@ -302,6 +305,7 @@ typedef struct moqr_record_view {
                                       * OPEN/ABANDONED for chunked records  */
     bool               datagram_pref;
     bool               end_of_group;
+    bool               first_object; /* see moqr_log_append_desc_t        */
     const moq_rcbuf_t *payload;      /* BORROWED; NULL for status/chunked   */
     const moq_rcbuf_t *properties;   /* BORROWED; NULL if none             */
     /* Chunked records (chunk_count > 0): payload is NULL and the retained

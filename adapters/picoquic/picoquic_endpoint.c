@@ -14,7 +14,9 @@
  */
 
 #include "picoquic_endpoint.h"
+#include <stdatomic.h>
 #include <stddef.h>
+#include <string.h>
 
 /* PICOQUIC_ERROR_DATAGRAM_TOO_LONG is defined in picoquic.h */
 #ifndef PICOQUIC_ERROR_DATAGRAM_TOO_LONG
@@ -181,10 +183,39 @@ static moq_transport_result_t pq_send_datagram(void *ctx,
 }
 
 /*
- * picoquic_close_ex accepts a reason string. We forward the reason
- * if provided; picoquic limits the reason in the CONNECTION_CLOSE
- * frame to its internal buffer size.
+ * picoquic_close_ex keeps the reason POINTER (cnx->local_error_reason) and
+ * re-reads it for every CONNECTION_CLOSE it sends or resends: after this call
+ * returns, and possibly after this adapter conn is destroyed (a caller-owned
+ * cnx outlives its adapter). The reason we get is only borrowed for the call,
+ * so copy it into an append-only table whose entries are never freed or
+ * rewritten. moq5's own reasons are static strings, so few distinct ones
+ * occur. Past the table's capacity the close carries no reason phrase
+ * (QUIC makes it optional).
  */
+#define PQ_REASON_SLOTS 64
+#define PQ_REASON_MAX   256
+static const char *pq_intern_reason(const uint8_t *r, size_t n)
+{
+    static char tbl[PQ_REASON_SLOTS][PQ_REASON_MAX];
+    static size_t count;
+    static atomic_flag lock = ATOMIC_FLAG_INIT;
+    const void *z = memchr(r, 0, n);
+    if (z) n = (size_t)((const uint8_t *)z - r);
+    if (n > PQ_REASON_MAX - 1) n = PQ_REASON_MAX - 1;
+    const char *out = NULL;
+    while (atomic_flag_test_and_set_explicit(&lock, memory_order_acquire))
+        ;   /* closes are rare; the critical section is a short scan */
+    for (size_t i = 0; i < count && !out; i++)
+        if (memcmp(tbl[i], r, n) == 0 && tbl[i][n] == '\0') out = tbl[i];
+    if (!out && count < PQ_REASON_SLOTS) {
+        memcpy(tbl[count], r, n);
+        tbl[count][n] = '\0';
+        out = tbl[count++];
+    }
+    atomic_flag_clear_explicit(&lock, memory_order_release);
+    return out;
+}
+
 static moq_transport_result_t pq_close(void *ctx, uint64_t code,
                                         const uint8_t *reason,
                                         size_t reason_len)
@@ -196,11 +227,8 @@ static moq_transport_result_t pq_close(void *ctx, uint64_t code,
     if (!ep->cnx) return MOQ_TRANSPORT_OK;
     int rc;
     if (reason && reason_len > 0) {
-        char buf[256];
-        size_t copy = reason_len < sizeof(buf) - 1 ? reason_len : sizeof(buf) - 1;
-        for (size_t i = 0; i < copy; i++) buf[i] = (char)reason[i];
-        buf[copy] = '\0';
-        rc = picoquic_close_ex(ep->cnx, code, buf);
+        rc = picoquic_close_ex(ep->cnx, code,
+                               pq_intern_reason(reason, reason_len));
     } else {
         rc = picoquic_close(ep->cnx, code);
     }

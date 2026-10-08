@@ -88,8 +88,22 @@ int picoquic_stop_sending(picoquic_cnx_t *c, uint64_t sid, uint64_t ec)
 static bool g_close_fail = false;
 int picoquic_close(picoquic_cnx_t *c, uint64_t ec)
     { (void)c; (void)ec; return g_close_fail ? -1 : 0; }
+/* picoquic keeps the reason POINTER (cnx->local_error_reason) and re-reads it
+ * for every CONNECTION_CLOSE it sends or resends: record it, so a test can
+ * check it still reads the reason after the call returned. */
+static const char *g_close_reason = NULL;
 int picoquic_close_ex(picoquic_cnx_t *c, uint64_t ec, const char *reason)
-    { (void)c; (void)ec; (void)reason; return g_close_fail ? -1 : 0; }
+    { (void)c; (void)ec; g_close_reason = reason; return g_close_fail ? -1 : 0; }
+
+/* Reuse the stack a returned call ran on (noinline + volatile keep it real). */
+#ifdef __GNUC__
+__attribute__((noinline))
+#endif
+static void scribble_stack(void)
+{
+    volatile char junk[4096];
+    for (size_t i = 0; i < sizeof(junk); i++) junk[i] = (char)0xA5;
+}
 uint64_t g_pending_app_error = 0;
 uint64_t picoquic_get_application_error(picoquic_cnx_t *c)
     { (void)c; return g_pending_app_error; }
@@ -2149,6 +2163,24 @@ int main(void)
         g_hook_count = 0;
         CHECK(moq_pq_service(ad, g_time) == 0);
         CHECK(g_hook_count == 1);
+        moq_pq_conn_destroy(ad);
+        moq_session_destroy(c); moq_session_destroy(s);
+    }
+
+    /* -- 120. The close reason outlives pq_close ----------------------- *
+     * picoquic re-reads the reason pointer for every CONNECTION_CLOSE it
+     * sends after picoquic_close_ex returned, so the pointer it was handed
+     * must still read the reason once the stack it was called on is reused. */
+    {
+        moq_session_t *c = NULL, *s = NULL;
+        (void)setup(&al, &c, &s, 0, 0);
+        moq_pq_conn_t *ad = mkad(&al, s);
+        CHECK(moq_session_close(s, 0x1, "close reason", g_time) == MOQ_OK);
+        g_close_reason = NULL;
+        CHECK(moq_pq_service(ad, g_time) == 0);
+        CHECK(g_close_reason != NULL);
+        scribble_stack();
+        CHECK(g_close_reason && strcmp(g_close_reason, "close reason") == 0);
         moq_pq_conn_destroy(ad);
         moq_session_destroy(c); moq_session_destroy(s);
     }
